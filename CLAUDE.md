@@ -2,7 +2,7 @@
 
 ## What This Project Does
 
-Takes raw influencer videos, swaps the face/identity with "Mia" (a virtual character), and outputs final clone videos. Two-stage AI pipeline: Higgsfield (image generation) → Wavespeed Kling (video generation).
+Takes raw influencer videos, swaps the face/identity with a custom AI character, and outputs final clone videos. Two-stage AI pipeline: Higgsfield (image generation) → Wavespeed Kling (video generation).
 
 ---
 
@@ -11,14 +11,14 @@ Takes raw influencer videos, swaps the face/identity with "Mia" (a virtual chara
 ```
 ai_inf_test/
 ├── raw material/           ← Put new input .mp4 videos here
-├── character sheet mia/    ← Mia's reference images (mia-main.png is the key one)
+├── character sheet mia/    ← AI character reference images (mia-main.png is the key one)
 ├── extracted frames/       ← Auto-generated best frames from each video
 ├── outputs/
 │   ├── higgsfield/         ← 4 generated images per video (output_1.png to output_4.png)
 │   └── wavespeed/          ← Final output video per video (output.mp4)
 ├── config.py               ← API keys, paths, Google Sheet config
 ├── extract_frame.py        ← Step 1: Extract best face frame from videos
-├── higgsfield_generate.py  ← Step 2: Generate 4 Mia-swapped images
+├── higgsfield_generate.py  ← Step 2: Generate 4 AI character-swapped images
 ├── wavespeed_generate.py   ← Step 4: Generate final video
 ├── sheets.py               ← Google Sheets integration (tracking)
 ├── setup_sheet.py          ← One-time sheet header setup
@@ -37,7 +37,7 @@ python extract_frame.py
 ```
 Output: `extracted frames/{video_name}_frame.png`
 
-### Step 2 — Generate Mia-swapped images (Higgsfield)
+### Step 2 — Generate AI character-swapped images (Higgsfield)
 ```bash
 python higgsfield_generate.py
 ```
@@ -88,5 +88,5 @@ The pipeline **skips already-completed steps automatically** and **marks the Goo
 
 - Videos longer than 10 seconds are auto-trimmed to 10s before Wavespeed upload
 - Higgsfield generates 4 images in parallel per video
-- `mia-main.png` = identity/face reference. Do not replace without updating the character
+- `mia-main.png` = AI character identity/face reference. Do not replace without updating the character
 - `face_landmarker.task` = MediaPipe model file, must stay in project root

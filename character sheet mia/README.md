@@ -1,4 +1,4 @@
-# Character Sheet — Mia
+# Character Sheet — AI Influencer
 
 Place your AI character's reference image in this folder.
 
@@ -8,7 +8,7 @@ Place your AI character's reference image in this folder.
 
 ## What this image should look like
 
-- Clear, front-facing photo of your character's face
+- Clear, front-facing photo of your AI character's face
 - Good lighting, sharp focus
 - Neutral or simple background works best
 - High resolution (at least 1080x1080)
@@ -23,7 +23,7 @@ The prompt instructs the model to copy:
 - Hair (style, color, texture)
 - Overall identity and look
 
-The scene, clothing, pose, and background always come from the original video — only the identity is replaced with this character.
+The scene, clothing, pose, and background always come from the original video — only the identity is replaced with your AI character.
 
 ## Tip
 

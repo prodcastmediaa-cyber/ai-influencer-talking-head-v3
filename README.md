@@ -1,8 +1,8 @@
 # AI Influencer Video Generator
 
-Automatically swap any influencer's face and identity with a custom AI character ("Mia") using a two-stage AI pipeline — Higgsfield for image generation and Wavespeed Kling for video generation.
+Automatically swap any influencer's face and identity with your custom AI character using a two-stage AI pipeline — Higgsfield for image generation and Wavespeed Kling for video generation.
 
-Drop in a raw video. Get back a video with Mia's face, same motion, same background.
+Drop in a raw video. Get back a video with your AI character's face, same motion, same background.
 
 ---
 
@@ -22,7 +22,7 @@ Raw Video (.mp4)
      │
      ▼
 [Stage 2 — Image Generation via Higgsfield]
-     Swap identity: Mia's face + scene from original
+     Swap identity: AI character's face + scene from original
      Generates 4 candidate images in parallel
      Model: nano_banana_2 (9:16, 2K resolution)
      │
@@ -32,7 +32,7 @@ Raw Video (.mp4)
      Model: Kling v2.6 Pro Motion Control
      │
      ▼
-Output Video (.mp4) — Mia's face, original motion
+Output Video (.mp4) — AI character's face, original motion
 ```
 
 ---
@@ -64,7 +64,7 @@ Output Video (.mp4) — Mia's face, original motion
 ai_inf_test/
 ├── run_pipeline.py          ← Main entry point — runs everything
 ├── extract_frame.py         ← Step 1: Extract best frame from video
-├── higgsfield_generate.py   ← Step 2: Generate 4 Mia-swapped images
+├── higgsfield_generate.py   ← Step 2: Generate 4 AI character-swapped images
 ├── wavespeed_generate.py    ← Step 4: Generate final output video
 ├── sheets.py                ← Google Sheets read/write helper
 ├── setup_sheet.py           ← One-time: creates sheet headers
@@ -73,7 +73,7 @@ ai_inf_test/
 ├── requirements.txt         ← Python dependencies
 ├── face_landmarker.task     ← MediaPipe model for face/eye detection
 ├── character sheet mia/
-│   └── mia-main.png         ← Mia's reference image (face, skin, hair, identity)
+│   └── mia-main.png         ← Your AI character's reference image (face, skin, hair, identity)
 ├── raw material/            ← Put your input .mp4 files here
 ├── extracted frames/        ← Auto-generated: best frame per video
 └── outputs/
@@ -148,13 +148,13 @@ A browser window will open. Log in. A `token.pickle` file will be saved — this
 mkdir -p "raw material" "extracted frames" "outputs/higgsfield" "outputs/wavespeed"
 ```
 
-### 6. Add Mia's reference image
+### 6. Add your AI character's reference image
 
 Place your character's reference photo at:
 ```
 character sheet mia/mia-main.png
 ```
-This is the identity source — Mia's face, skin tone, hair, and overall look will be used in every generated image.
+This is the identity source — your AI character's face, skin tone, hair, and overall look will be used in every generated image.
 
 ---
 
@@ -171,7 +171,7 @@ python3 run_pipeline.py
 
 The script will:
 - Extract the best frame automatically
-- Generate 4 Mia-swapped images via Higgsfield
+- Generate 4 AI character-swapped images via Higgsfield
 - **Pause** and tell you to pick the best image
 
 ### Step 3 — Pick the best image (manual)
@@ -233,7 +233,7 @@ background environment, lighting setup and overall atmosphere.
 Do not use face structure, skin tone, hair, and identity from image 2.
 ```
 
-**Reference image 1** = `character sheet mia/mia-main.png` (Mia's identity)
+**Reference image 1** = `character sheet mia/mia-main.png` (your AI character's identity)
 **Reference image 2** = extracted frame from the original video (scene, pose, clothing)
 
 Settings used:
@@ -323,4 +323,4 @@ Delete `token.pickle` and run `python3 setup_sheet.py` again to re-authenticate.
 
 ## LLM Context Summary
 
-If you are an LLM reading this repo: this project is a local Python automation pipeline running on macOS. It has no web server, no frontend, and no database. All state is stored in local folders and one Google Sheet. The entry point for running is `run_pipeline.py`. The two external AI APIs are Higgsfield (image generation via CLI) and Wavespeed (video generation via REST API). The `config.py` file (not committed) holds all keys and paths. The `face_landmarker.task` file is a pre-downloaded MediaPipe model binary. The character reference image `mia-main.png` is the identity source for all generated content.
+If you are an LLM reading this repo: this project is a local Python automation pipeline running on macOS. It has no web server, no frontend, and no database. All state is stored in local folders and one Google Sheet. The entry point for running is `run_pipeline.py`. The two external AI APIs are Higgsfield (image generation via CLI) and Wavespeed (video generation via REST API). The `config.py` file (not committed) holds all keys and paths. The `face_landmarker.task` file is a pre-downloaded MediaPipe model binary. The character reference image inside `character sheet mia/` is the AI character identity source for all generated content.
