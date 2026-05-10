@@ -15,13 +15,11 @@ from config import (
     OUTPUTS_DIR,
 )
 
-# Neutral, minimal prompt — avoids face-swap language that triggers NSFW filters
 PROMPT = (
-    "Photorealistic portrait of the woman from image 1, "
-    "placed in the same setting, outfit, and pose as image 2. "
-    "Natural skin texture, real skin pores, subtle imperfections, no retouching, no airbrushing, "
-    "no plastic skin, shot on camera, candid, authentic human face. "
-    "Cinematic lighting, high detail, 9:16 vertical."
+    "The character from image 1 placed into the exact scene from image 2. "
+    "Use image 2 for all scene details: background, location, clothing, body pose, lighting, and composition. "
+    "Use image 1 only for the face and identity. "
+    "Photorealistic, sharp focus, high detail, 9:16 vertical."
 )
 
 MODEL       = "nano_banana_2"

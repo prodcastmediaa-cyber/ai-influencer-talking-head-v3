@@ -32,10 +32,21 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, filters,
+)
+
+# Persistent bottom menu — always visible in the chat input area
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["▶️ Start / Scan Queue", "📊 Status"],
+        ["🔄 Hard Restart",       "🗑 Clean All"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Paste a TikTok / Instagram / YouTube link...",
 )
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -91,14 +102,25 @@ def _acquire_pid_lock() -> None:
                 log.info(f"[pid] Found old instance (PID {old_pid}) — stopping it...")
                 try:
                     os.kill(old_pid, signal.SIGTERM)
-                    time.sleep(2)
                 except ProcessLookupError:
-                    pass
-                try:
-                    os.kill(old_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                log.info(f"[pid] Old instance stopped.")
+                    old_pid = None
+                if old_pid:
+                    # Poll until the process is actually gone (up to 5s graceful)
+                    for _ in range(10):
+                        try:
+                            os.kill(old_pid, 0)
+                            time.sleep(0.5)
+                        except ProcessLookupError:
+                            old_pid = None
+                            break
+                    # Force-kill if still alive after graceful window
+                    if old_pid:
+                        try:
+                            os.kill(old_pid, signal.SIGKILL)
+                            time.sleep(1)
+                        except ProcessLookupError:
+                            pass
+                log.info("[pid] Old instance stopped.")
         except (ValueError, OSError):
             pass
 
@@ -691,8 +713,10 @@ async def _on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     loop = asyncio.get_running_loop()
     try:
         final = await loop.run_in_executor(_executor, _download_url, text, name)
+        queue_depth = len(_processing)
+        queue_note = f"\n⏳ {queue_depth} other video(s) processing — yours is queued." if queue_depth else ""
         await msg.edit_text(
-            f"✅ *{name}* — Downloaded! Pipeline starting...", parse_mode="Markdown"
+            f"✅ *{name}* — Downloaded! Pipeline starting...{queue_note}", parse_mode="Markdown"
         )
         log.info(f"[download] {text} → {final}")
     except Exception as e:
@@ -1109,8 +1133,9 @@ async def _on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"*How to add a video:*\n"
         f"• Paste a TikTok / Instagram / YouTube link\n"
         f"• Or send a video file (up to 20 MB)\n\n"
-        f"/help — see all commands and buttons",
+        f"Use the buttons below or type /help for all commands.",
         parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -1127,8 +1152,9 @@ async def _on_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "3️⃣ You pick the best image (tap 1/2/3/4)\n"
         "4️⃣ Final video → Telegram + Google Drive link\n\n"
         "*Commands:*\n"
-        "/status — See all videos and their stage\n"
-        "/cancel — Cancel & delete a video from the queue\n"
+        "/status — See all videos, stages, clean + restart buttons\n"
+        "/clean — Wipe everything and start fresh\n"
+        "/cancel — Cancel & delete one video\n"
         "/help — Show this message\n\n"
         "*Buttons:*\n"
         "✅ Pick 1/2/3/4 — choose the best AI image\n"
@@ -1150,34 +1176,202 @@ async def _on_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     videos = sorted(glob.glob(os.path.join(RAW_MATERIAL_DIR, "*.mp4")))
+    active = len(_processing)
+
     if not videos:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Clean All", callback_data="clean_confirm_direct"),
+        ]])
         await update.message.reply_text(
             "📭 *Queue is empty.*\n\nSend a URL or video file to get started!",
             parse_mode="Markdown",
+            reply_markup=keyboard,
         )
         return
 
-    lines = ["*Pipeline Status*\n"]
+    lines = [f"*Pipeline Status* — {active} job(s) active\n"]
     for v in videos:
         name = _vname(v)
         if _has_output(name):
             s = "✅ Done"
         elif _has_selected(name):
-            s = "⚡ Wavespeed running"
+            s = _stage.get(name, "⚡ Wavespeed running")
         elif _has_higgsfield(name):
             s = _stage.get(name, "👆 Waiting for image pick")
         elif _has_frame(name):
-            s = _stage.get(name, "⏸ Waiting for frame approval")
+            s = _stage.get(name, "🎨 Generating images...")
         else:
             s = _stage.get(name, "📥 Extracting frame")
-        lines.append(f"• `{name}`: {s}")
+        active_tag = " ⚙️" if name in _processing else ""
+        lines.append(f"• `{name}`: {s}{active_tag}")
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ Cancel a Video", callback_data="cancel_list"),
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("❌ Cancel a Video", callback_data="cancel_list"),
+            InlineKeyboardButton("🔄 Hard Restart", callback_data="hard_restart"),
+        ],
+        [InlineKeyboardButton("🗑 Clean All", callback_data="clean_prompt")],
+    ])
     await update.message.reply_text(
         "\n".join(lines), parse_mode="Markdown", reply_markup=keyboard
     )
+
+
+# ── /clean and hard-restart ───────────────────────────────────────────────────
+
+async def _on_keyboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle taps on the persistent bottom keyboard."""
+    text = update.message.text
+
+    if text == "📊 Status":
+        await _on_status(update, context)
+
+    elif text == "▶️ Start / Scan Queue":
+        await update.message.reply_text("🔍 Scanning queue...", parse_mode="Markdown")
+        await _startup_scan()
+
+    elif text == "🔄 Hard Restart":
+        await update.message.reply_text(
+            "🔄 *Hard restarting...* cancelling all jobs and rescanning.",
+            parse_mode="Markdown",
+        )
+        with _lock:
+            for name in list(_processing):
+                _cancelled.add(name)
+            _processing.clear()
+        _stage.clear()
+        _retry_counts.clear()
+        _cancelled.clear()
+        await asyncio.sleep(1)
+        await _startup_scan()
+
+    elif text == "🗑 Clean All":
+        await _on_clean_cmd(update, context)
+
+
+async def _on_clean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/clean — show what will be wiped and ask for confirmation."""
+    await _show_clean_prompt(update.message.reply_text)
+
+
+async def _show_clean_prompt(reply_fn) -> None:
+    videos  = glob.glob(os.path.join(RAW_MATERIAL_DIR, "*.mp4"))
+    frames  = glob.glob(os.path.join(EXTRACTED_FRAMES_DIR, "*_frame.png"))
+    hf_dirs = [d for d in glob.glob(os.path.join(OUTPUTS_DIR, "higgsfield", "*")) if os.path.isdir(d)]
+    ws_dirs = [d for d in glob.glob(os.path.join(OUTPUTS_DIR, "wavespeed", "*")) if os.path.isdir(d)]
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Yes, wipe everything", callback_data="clean_confirm_direct")],
+        [InlineKeyboardButton("✖️ Cancel", callback_data="clean_cancel")],
+    ])
+    await reply_fn(
+        f"⚠️ *Clean All — this cannot be undone:*\n\n"
+        f"• {len(videos)} raw video(s)\n"
+        f"• {len(frames)} extracted frame(s)\n"
+        f"• {len(hf_dirs)} Higgsfield folder(s)\n"
+        f"• {len(ws_dirs)} Wavespeed output(s)\n\n"
+        f"All in-progress jobs will be cancelled.\n\n"
+        f"Continue?",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def _on_clean_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clean All button from /status — show the confirmation dialog."""
+    query = update.callback_query
+    await query.answer()
+    await _show_clean_prompt(query.message.reply_text)
+
+
+def _do_clean_sync() -> dict:
+    """Blocking file deletion — runs in a thread executor from _do_clean()."""
+    deleted = {"videos": 0, "frames": 0, "hf": 0, "ws": 0}
+
+    for f in glob.glob(os.path.join(RAW_MATERIAL_DIR, "*.mp4")):
+        try:
+            os.remove(f)
+            deleted["videos"] += 1
+        except OSError:
+            pass
+
+    for f in glob.glob(os.path.join(EXTRACTED_FRAMES_DIR, "*_frame.png")):
+        try:
+            os.remove(f)
+            deleted["frames"] += 1
+        except OSError:
+            pass
+
+    for d in glob.glob(os.path.join(OUTPUTS_DIR, "higgsfield", "*")):
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+            deleted["hf"] += 1
+
+    for d in glob.glob(os.path.join(OUTPUTS_DIR, "wavespeed", "*")):
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+            deleted["ws"] += 1
+
+    return deleted
+
+
+async def _do_clean() -> dict:
+    """Wipe all pipeline files and cancel all in-progress jobs. Returns counts."""
+    with _lock:
+        for name in list(_processing):
+            _cancelled.add(name)
+        _processing.clear()
+    _stage.clear()
+    _retry_counts.clear()
+
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(_executor, _do_clean_sync)
+
+    _cancelled.clear()
+    return deleted
+
+
+async def _on_clean_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirmed — wipe everything."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🗑 Cleaning...", parse_mode="Markdown")
+
+    deleted = await _do_clean()
+
+    await query.edit_message_text(
+        f"✅ *All clear!*\n\n"
+        f"• {deleted['videos']} video(s) deleted\n"
+        f"• {deleted['frames']} frame(s) deleted\n"
+        f"• {deleted['hf']} Higgsfield folder(s) deleted\n"
+        f"• {deleted['ws']} Wavespeed output(s) deleted\n\n"
+        f"Queue is empty. Send a link or video to start fresh.",
+        parse_mode="Markdown",
+    )
+
+
+async def _on_clean_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("👍 Clean cancelled — nothing deleted.")
+
+
+async def _on_hard_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel all in-progress jobs, clear state, re-scan disk and resume."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🔄 *Hard restarting...* cancelling all jobs and rescanning.", parse_mode="Markdown")
+
+    with _lock:
+        for name in list(_processing):
+            _cancelled.add(name)
+        _processing.clear()
+    _stage.clear()
+    _retry_counts.clear()
+    _cancelled.clear()
+
+    await asyncio.sleep(1)
+    await _startup_scan()
 
 
 # ── Watchdog ──────────────────────────────────────────────────────────────────
@@ -1272,6 +1466,7 @@ async def main() -> None:
     _app.add_handler(CommandHandler("status", _on_status))
     _app.add_handler(CommandHandler("help",   _on_help))
     _app.add_handler(CommandHandler("cancel", _on_cancel_cmd))
+    _app.add_handler(CommandHandler("clean",  _on_clean_cmd))
 
     # Callback buttons — order matters: more specific patterns first
     _app.add_handler(CallbackQueryHandler(_on_frame_approve,      pattern=r"^frame_approve:"))
@@ -1291,6 +1486,19 @@ async def main() -> None:
     _app.add_handler(CallbackQueryHandler(_on_frame_retry_full,   pattern=r"^frame_retry_full:"))
     _app.add_handler(CallbackQueryHandler(_on_action_start,       pattern=r"^action:start$"))
     _app.add_handler(CallbackQueryHandler(_on_retry_url,          pattern=r"^retry_url:"))
+    _app.add_handler(CallbackQueryHandler(_on_clean_prompt,       pattern=r"^clean_prompt$"))
+    _app.add_handler(CallbackQueryHandler(_on_clean_confirm,      pattern=r"^clean_confirm_direct$"))
+    _app.add_handler(CallbackQueryHandler(_on_clean_cancel,       pattern=r"^clean_cancel$"))
+    _app.add_handler(CallbackQueryHandler(_on_hard_restart,       pattern=r"^hard_restart$"))
+
+    # Persistent keyboard buttons (must be registered before the URL handler)
+    _kb_filter = filters.Text([
+        "▶️ Start / Scan Queue",
+        "📊 Status",
+        "🔄 Hard Restart",
+        "🗑 Clean All",
+    ])
+    _app.add_handler(MessageHandler(_kb_filter, _on_keyboard_button))
 
     # Messages
     _app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, _on_video_upload))
@@ -1303,28 +1511,27 @@ async def main() -> None:
 
     await _app.initialize()
     await _app.start()
+    # Brief pause so Telegram releases the previous instance's long-poll connection
+    # before we start polling (avoids "Conflict: terminated by other getUpdates" errors)
+    await asyncio.sleep(3)
     await _app.updater.start_polling(drop_pending_updates=True)
     log.info("[bot] Telegram polling started")
 
     if TELEGRAM_CHAT_ID:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ Start", callback_data="action:start")],
-            [InlineKeyboardButton("❌ Cancel a Video", callback_data="cancel_list")],
-        ])
         await _app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
                 "🚀 *Pipeline bot is live!*\n\n"
-                "Send me a TikTok / Instagram link\n"
-                "or upload a video file directly.\n\n"
-                "I'll guide you through every step with buttons.\n\n"
-                "/help — all commands\n"
-                "/status — current pipeline\n"
-                "/cancel — cancel & delete a video\n\n"
-                "Tap *Start* to scan for existing videos."
+                "Paste a TikTok / Instagram / YouTube link\n"
+                "or send a video file directly.\n\n"
+                "Use the *buttons below* to control the pipeline:\n"
+                "▶️ *Start / Scan Queue* — resume any pending jobs\n"
+                "📊 *Status* — see what's processing\n"
+                "🔄 *Hard Restart* — cancel all and rescan\n"
+                "🗑 *Clean All* — wipe everything and start fresh"
             ),
             parse_mode="Markdown",
-            reply_markup=keyboard,
+            reply_markup=MAIN_KEYBOARD,
         )
     else:
         log.info("[bot] Waiting for chat ID — send /start to your bot in Telegram.")
