@@ -1,24 +1,35 @@
-# Secrets — never commit these
+# ─── Secrets — NEVER commit these ────────────────────────────────────────────
 credentials.json
 token.pickle
 config.py
+cookies.txt
 
-# Character reference images — add your own
-character sheet mia/*.png
-character sheet mia/*.jpg
-character sheet mia/*.jpeg
-character sheet mia/*.webp
+# ─── Character reference images — add your own, don't commit others' ──────────
+character sheet/*.png
+character sheet/*.jpg
+character sheet/*.jpeg
+character sheet/*.webp
+character sheet/*.gif
 
-# Large media — store separately
+# ─── Large media — store separately (too large for git) ───────────────────────
 raw material/
 outputs/
 extracted frames/
 
-# Mac system files
+# ─── Runtime state ────────────────────────────────────────────────────────────
+.watcher.pid
+watcher.log
+
+# ─── Binary model files — downloaded automatically on first run ───────────────
+*.task
+*.pb
+
+# ─── macOS system files ────────────────────────────────────────────────────────
 .DS_Store
 **/.DS_Store
+com.*.plist
 
-# Python
+# ─── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
@@ -30,3 +41,7 @@ build/
 .venv/
 venv/
 env/
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/

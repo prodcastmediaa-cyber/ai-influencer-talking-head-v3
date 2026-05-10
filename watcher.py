@@ -1,0 +1,1343 @@
+"""
+24/7 AI Influencer pipeline daemon — cloud edition.
+
+Input via Telegram:
+  • Paste a TikTok / Instagram / YouTube URL → downloaded automatically
+  • Send a video file (up to 20 MB) → saved automatically
+
+Pipeline:
+  Step 1 — Extract best face frame
+  Step 2 — You approve the frame (or retry for a different one)
+  Step 3 — Higgsfield generates 4 images  (live progress bar)
+  Step 4 — You pick the best image
+  Step 5 — Wavespeed generates the final video
+  Step 6 — Video sent to Telegram + uploaded to Google Drive
+
+Commands:
+  /start   — confirm the bot is live
+  /status  — see every video and its current stage
+  /help    — list all commands and buttons
+"""
+import asyncio
+import atexit
+import glob
+import logging
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler,
+    ContextTypes, MessageHandler, filters,
+)
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+
+from config import (
+    EXTRACTED_FRAMES_DIR,
+    OUTPUTS_DIR,
+    RAW_MATERIAL_DIR,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+)
+
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+
+try:
+    import drive_upload as _drive
+    _DRIVE_ENABLED = True
+except Exception:
+    _DRIVE_ENABLED = False
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+_log_handlers = [logging.FileHandler("watcher.log")]
+if sys.stderr.isatty():
+    # Only add console output when running interactively (not as a daemon)
+    _log_handlers.append(logging.StreamHandler())
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=_log_handlers,
+)
+log = logging.getLogger(__name__)
+
+# Suppress httpx/telegram network logs — they log the full API URL which
+# contains the bot token in plaintext on every request.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
+# ── Single-instance lock ──────────────────────────────────────────────────────
+
+_PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".watcher.pid")
+
+
+def _acquire_pid_lock() -> None:
+    """Kill any running instance, then write our PID. Runs before anything else."""
+    if os.path.exists(_PID_FILE):
+        try:
+            with open(_PID_FILE) as f:
+                old_pid = int(f.read().strip())
+            if old_pid != os.getpid():
+                log.info(f"[pid] Found old instance (PID {old_pid}) — stopping it...")
+                try:
+                    os.kill(old_pid, signal.SIGTERM)
+                    time.sleep(2)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.kill(old_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                log.info(f"[pid] Old instance stopped.")
+        except (ValueError, OSError):
+            pass
+
+    with open(_PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    def _remove_pid():
+        try:
+            os.remove(_PID_FILE)
+        except FileNotFoundError:
+            pass
+
+    atexit.register(_remove_pid)
+
+# ── Globals ───────────────────────────────────────────────────────────────────
+
+_executor = ThreadPoolExecutor(max_workers=2)
+_processing: set = set()   # names currently running through the pipeline
+_cancelled: set = set()    # names marked for cancellation
+_retry_counts: dict = {}
+_stage: dict = {}          # name → human-readable current stage string
+_lock = threading.Lock()
+_loop: asyncio.AbstractEventLoop = None
+_app: Application = None
+
+
+# ── State helpers ─────────────────────────────────────────────────────────────
+
+def _vname(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0]
+
+def _has_output(name: str) -> bool:
+    return os.path.exists(os.path.join(OUTPUTS_DIR, "wavespeed", name, "output.mp4"))
+
+def _has_selected(name: str) -> bool:
+    return os.path.exists(os.path.join(OUTPUTS_DIR, "higgsfield", name, "selected.png"))
+
+def _has_higgsfield(name: str) -> bool:
+    return bool(glob.glob(os.path.join(OUTPUTS_DIR, "higgsfield", name, "output_*.png")))
+
+def _has_frame(name: str) -> bool:
+    return os.path.exists(os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png"))
+
+def _higgsfield_images(name: str) -> list:
+    return sorted(glob.glob(os.path.join(OUTPUTS_DIR, "higgsfield", name, "output_*.png")))
+
+
+# ── Telegram helpers ──────────────────────────────────────────────────────────
+
+async def _notify(text: str) -> None:
+    try:
+        await _app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.error(f"Telegram notify failed: {e}")
+
+
+async def _safe_edit(query, text: str, keyboard=None) -> None:
+    """Edit text or caption correctly depending on whether the message is a photo."""
+    try:
+        if query.message.photo:
+            await query.edit_message_caption(
+                caption=text, parse_mode="Markdown", reply_markup=keyboard
+            )
+        else:
+            await query.edit_message_text(
+                text=text, parse_mode="Markdown", reply_markup=keyboard
+            )
+    except Exception as e:
+        log.warning(f"_safe_edit failed: {e}")
+
+
+async def _send_failure_actions(name: str, reason: str) -> None:
+    retries = _retry_counts.get(name, 0)
+    if retries == 0:
+        keyboard = [[InlineKeyboardButton("🔄 Retry", callback_data=f"retry:{name}")]]
+        footer = "Tap *Retry* to try again."
+    else:
+        keyboard = [[InlineKeyboardButton("🗑 Delete Video", callback_data=f"delete_video:{name}")]]
+        footer = "Retry failed again. Tap *Delete Video* to remove all files for this video."
+    await _app.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=f"❌ *{name}* — {reason}\n\n{footer}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def _send_frame_approval(name: str) -> None:
+    """Show the extracted frame and ask user to approve before spending Higgsfield credits."""
+    frame_path = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Generate Images", callback_data=f"frame_approve:{name}"),
+            InlineKeyboardButton("🔄 New Frame", callback_data=f"frame_retry:{name}"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{name}")],
+    ])
+    with open(frame_path, "rb") as f:
+        await _app.bot.send_photo(
+            chat_id=TELEGRAM_CHAT_ID,
+            photo=f,
+            caption=(
+                f"🖼 *{name}* — Frame extracted!\n\n"
+                "Does this look good?\n"
+                "• *Generate Images* → start AI generation\n"
+                "• *New Frame* → try a different frame\n"
+                "• *Cancel* → stop processing"
+            ),
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+    _stage[name] = "⏸ Waiting for frame approval"
+
+
+async def _send_selection_prompt(name: str) -> None:
+    images = _higgsfield_images(name)
+    if not images:
+        return
+
+    for i, path in enumerate(images, 1):
+        with open(path, "rb") as f:
+            await _app.bot.send_photo(
+                chat_id=TELEGRAM_CHAT_ID,
+                photo=f,
+                caption=f"`{name}` — Option {i}",
+                parse_mode="Markdown",
+            )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(f"✅ Pick {i}", callback_data=f"sel:{i}:{name}")
+            for i in range(1, len(images) + 1)
+        ],
+        [
+            InlineKeyboardButton("🔄 Restart Gen", callback_data=f"hf_restart:{name}"),
+            InlineKeyboardButton("🖼 See Frame", callback_data=f"see_frame:{name}"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{name}")],
+    ]
+    await _app.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=f"👆 *{name}* — Tap to pick the best one:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    _stage[name] = "👆 Waiting for image pick"
+
+
+# ── Blocking pipeline steps (run in thread executor) ─────────────────────────
+
+def _step1_extract(name: str) -> None:
+    import cv2
+    from extract_frame import (
+        build_face_landmarker, build_hand_landmarker,
+        ensure_hand_model, ensure_sr_model,
+        extract_candidates, pick_best_frame, upscale_frame,
+    )
+    video_path = os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4")
+    out = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+    tmp_dir = os.path.join(EXTRACTED_FRAMES_DIR, f"_tmp_{name}")
+
+    ensure_hand_model()
+    ensure_sr_model()
+    os.makedirs(EXTRACTED_FRAMES_DIR, exist_ok=True)
+
+    face_lmk = build_face_landmarker()
+    hand_lmk = build_hand_landmarker()
+    extract_candidates(video_path, tmp_dir)
+    best, _ = pick_best_frame(tmp_dir, face_lmk, hand_lmk)
+    if best:
+        img = cv2.imread(best)
+        cv2.imwrite(out, upscale_frame(img))
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _step2_higgsfield(name: str, on_progress=None) -> None:
+    from higgsfield_generate import generate_for_video
+    frame = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+    generate_for_video(frame, on_progress=on_progress)
+
+
+def _step4_wavespeed(name: str) -> str:
+    from wavespeed_generate import process_video
+    video_path = os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4")
+    return process_video(video_path)
+
+
+def _video_dimensions(path: str) -> tuple:
+    import json
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "json", path],
+        capture_output=True, text=True,
+    )
+    streams = json.loads(r.stdout).get("streams", [{}])
+    return streams[0].get("width", 1080), streams[0].get("height", 1920)
+
+
+# ── File stability check ──────────────────────────────────────────────────────
+
+async def _wait_until_stable(path: str) -> bool:
+    prev = -1
+    for _ in range(15):
+        await asyncio.sleep(2)
+        if not os.path.exists(path):
+            continue
+        size = os.path.getsize(path)
+        if size == prev and size > 0:
+            return True
+        prev = size
+    return os.path.exists(path) and os.path.getsize(path) > 0
+
+
+# ── Sub-pipeline: frame extract (used by retry too) ──────────────────────────
+
+async def _do_frame_extract(name: str) -> None:
+    """Extract frame then auto-start Higgsfield generation."""
+    loop = asyncio.get_running_loop()
+    with _lock:
+        _processing.add(name)
+    _stage[name] = "📥 Extracting frame"
+    await loop.run_in_executor(_executor, _step1_extract, name)
+
+    if name in _cancelled:
+        with _lock:
+            _processing.discard(name)
+        return
+
+    if not _has_frame(name):
+        await _notify(f"❌ *{name}* — Frame extraction failed. Check logs.")
+        with _lock:
+            _processing.discard(name)
+        return
+
+    asyncio.create_task(_do_higgsfield(name))
+
+
+# ── Sub-pipeline: Higgsfield with live progress bar ──────────────────────────
+
+async def _do_higgsfield(name: str) -> None:
+    loop = asyncio.get_running_loop()
+
+    if name in _cancelled:
+        return
+
+    cancel_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{name}")
+    ]])
+
+    progress_msg = await _app.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=f"🎨 *{name}* — Generating images... [░░░░] 0/4",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb,
+    )
+    _stage[name] = "🎨 Generating images (0/4)"
+
+    def _on_progress(count: int):
+        if name in _cancelled:
+            return
+        bar = "▓" * count + "░" * (4 - count)
+        _stage[name] = f"🎨 Generating images ({count}/4)"
+        try:
+            asyncio.run_coroutine_threadsafe(
+                progress_msg.edit_text(
+                    f"🎨 *{name}* — Generating images... [{bar}] {count}/4",
+                    parse_mode="Markdown",
+                    reply_markup=cancel_kb,
+                ),
+                _loop,
+            ).result(timeout=10)
+        except Exception:
+            pass
+
+    try:
+        await loop.run_in_executor(_executor, _step2_higgsfield, name, _on_progress)
+    except Exception as e:
+        log.exception(f"[{name}] Higgsfield error")
+
+    if name in _cancelled:
+        return
+
+    if not _has_higgsfield(name):
+        try:
+            await progress_msg.edit_text(
+                f"❌ *{name}* — Image generation failed.",
+                parse_mode="Markdown",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+        await _send_failure_actions(name, "Higgsfield failed (NSFW or API error).")
+        with _lock:
+            _processing.discard(name)
+        return
+
+    try:
+        await progress_msg.edit_text(
+            f"✅ *{name}* — 4 images ready! Choose the best one below.",
+            parse_mode="Markdown",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    await _send_selection_prompt(name)
+
+
+# ── Sub-pipeline: Wavespeed + Drive upload ────────────────────────────────────
+
+async def _do_wavespeed(name: str, loop: asyncio.AbstractEventLoop = None) -> None:
+    if loop is None:
+        loop = asyncio.get_running_loop()
+    _stage[name] = "⚡ Wavespeed running"
+    try:
+        await _notify(f"⚡ *{name}* — Running Wavespeed Kling...")
+        out_path = await loop.run_in_executor(_executor, _step4_wavespeed, name)
+
+        if out_path and os.path.exists(out_path):
+            _retry_counts.pop(name, None)
+            size_mb = os.path.getsize(out_path) / 1_000_000
+            width, height = _video_dimensions(out_path)
+            await _notify(f"✅ *{name}* — Done! Uploading video ({size_mb:.1f} MB)...")
+            with open(out_path, "rb") as f:
+                await _app.bot.send_video(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    video=f,
+                    caption=f"🎬 *{name}*",
+                    parse_mode="Markdown",
+                    supports_streaming=True,
+                    width=width,
+                    height=height,
+                )
+            if _DRIVE_ENABLED:
+                try:
+                    drive_link = await loop.run_in_executor(
+                        _executor, _drive.upload_video, out_path, name
+                    )
+                    await _notify(f"📁 *{name}* — [Open in Google Drive]({drive_link})")
+                except Exception as drive_err:
+                    log.warning(f"[{name}] Drive upload failed (non-fatal): {drive_err}")
+            _stage[name] = "✅ Done"
+        else:
+            await _notify(f"⚠️ *{name}* — Wavespeed finished but no output found.")
+    except Exception as e:
+        log.exception(f"[{name}] Wavespeed error")
+        await _notify(f"❌ *{name}* — Wavespeed failed: `{e}`")
+    finally:
+        with _lock:
+            _processing.discard(name)
+
+
+# ── Core pipeline coroutine ───────────────────────────────────────────────────
+
+async def _pipeline(name: str, stable: bool = False) -> None:
+    with _lock:
+        if name in _processing:
+            log.info(f"[{name}] Already in progress — skipping duplicate.")
+            return
+        _processing.add(name)
+
+    loop = asyncio.get_running_loop()
+    try:
+        video_path = os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4")
+
+        if not stable and not await _wait_until_stable(video_path):
+            await _notify(f"❌ *{name}* — File not readable after waiting.")
+            with _lock:
+                _processing.discard(name)
+            return
+
+        if name in _cancelled:
+            with _lock:
+                _processing.discard(name)
+            return
+
+        # Step 1 — extract best frame
+        if not _has_frame(name):
+            _stage[name] = "📥 Extracting frame"
+            await _notify(f"📥 *{name}* — New video! Extracting best frame...")
+            await loop.run_in_executor(_executor, _step1_extract, name)
+
+            if name in _cancelled:
+                with _lock:
+                    _processing.discard(name)
+                return
+            if not _has_frame(name):
+                await _notify(f"❌ *{name}* — Frame extraction failed. Check logs.")
+                with _lock:
+                    _processing.discard(name)
+                return
+
+        # Step 2 — auto-start Higgsfield (no frame approval gate)
+        if not _has_higgsfield(name):
+            if name in _cancelled:
+                with _lock:
+                    _processing.discard(name)
+                return
+            asyncio.create_task(_do_higgsfield(name))
+            return
+
+        # Step 3 — (startup resume: Higgsfield images exist but not picked yet)
+        if not _has_selected(name):
+            if name in _cancelled:
+                with _lock:
+                    _processing.discard(name)
+                return
+            await _send_selection_prompt(name)
+            return
+
+        # Step 4 — (startup resume: selected.png exists, run Wavespeed)
+        await _do_wavespeed(name, loop)
+
+    except Exception as e:
+        log.exception(f"[{name}] Unexpected pipeline error")
+        await _send_failure_actions(name, f"Pipeline error: `{e}`")
+        with _lock:
+            _processing.discard(name)
+
+
+# ── Telegram handlers ─────────────────────────────────────────────────────────
+
+async def _on_frame_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User approved the extracted frame — start Higgsfield."""
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    if name in _cancelled:
+        await _safe_edit(query, f"❌ *{name}* — Already cancelled.")
+        return
+
+    await _safe_edit(query, f"✅ *{name}* — Frame approved! Starting image generation...")
+    asyncio.create_task(_do_higgsfield(name))
+
+
+async def _on_frame_retry_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User wants a different frame — delete current and re-extract."""
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    frame_path = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+    if os.path.exists(frame_path):
+        os.remove(frame_path)
+    with _lock:
+        _processing.discard(name)
+    _cancelled.discard(name)
+
+    await _safe_edit(query, f"🔄 *{name}* — Trying a different frame...")
+    asyncio.create_task(_do_frame_extract(name))
+
+
+async def _on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel processing for a video at any stage."""
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    _cancelled.add(name)
+    with _lock:
+        _processing.discard(name)
+    _stage.pop(name, None)
+
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
+    frame_path = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+    if os.path.exists(frame_path):
+        os.remove(frame_path)
+
+    await _safe_edit(query, f"❌ *{name}* — Cancelled and cleaned up.", keyboard=None)
+    log.info(f"[{name}] Cancelled by user.")
+
+
+async def _on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, num_str, name = query.data.split(":", 2)
+    num = int(num_str)
+
+    if _has_output(name):
+        await query.edit_message_text(f"✅ *{name}* already completed.", parse_mode="Markdown")
+        return
+
+    src = os.path.join(OUTPUTS_DIR, "higgsfield", name, f"output_{num}.png")
+    dst = os.path.join(OUTPUTS_DIR, "higgsfield", name, "selected.png")
+
+    if not os.path.exists(src):
+        await query.edit_message_text(f"❌ `output_{num}.png` not found for `{name}`.")
+        return
+
+    shutil.copy2(src, dst)
+    log.info(f"[{name}] User picked output_{num}.png → selected.png")
+
+    await query.edit_message_text(
+        f"✅ *{name}* — Picked option {num}! Starting Wavespeed...",
+        parse_mode="Markdown",
+    )
+    asyncio.create_task(_do_wavespeed(name))
+
+
+def _next_video_name() -> str:
+    existing = glob.glob(os.path.join(RAW_MATERIAL_DIR, "video*.mp4"))
+    nums = []
+    for f in existing:
+        stem = _vname(f)
+        if stem.startswith("video") and stem[5:].isdigit():
+            nums.append(int(stem[5:]))
+    return f"video{max(nums) + 1}" if nums else "video1"
+
+
+def _download_url(url: str, name: str) -> str:
+    import tempfile
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, f"{name}.mp4")
+    try:
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "-f", "bestvideo+bestaudio/best",
+            "--merge-output-format", "mp4",
+            "--socket-timeout", "30",
+            "--retries", "5",
+            "--fragment-retries", "10",
+            "--extractor-retries", "5",
+            "--retry-sleep", "3",
+            "-o", tmp_path,
+        ]
+        if os.path.exists(COOKIES_FILE):
+            cmd += ["--cookies", COOKIES_FILE]
+        cmd.append(url)
+
+        last_err = ""
+        for attempt in range(1, 4):
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            if result.returncode == 0:
+                break
+            last_err = result.stderr.strip() or result.stdout.strip()
+            is_timeout = "timed out" in last_err.lower() or "timeout" in last_err.lower()
+            if not is_timeout or attempt == 3:
+                raise RuntimeError(last_err)
+            log.warning(f"[download] Attempt {attempt} timed out — retrying in 5s...")
+            time.sleep(5)
+        else:
+            raise RuntimeError(last_err)
+
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name",
+             "-of", "default=noprint_wrappers=1:nokey=1", tmp_path],
+            capture_output=True, text=True,
+        )
+        codec = probe.stdout.strip()
+        if codec != "h264":
+            log.info(f"[download] Re-encoding {codec} → H.264...")
+            h264_path = tmp_path.replace(".mp4", "_h264.mp4")
+            enc = subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_path,
+                 "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                 "-c:a", "aac", "-movflags", "+faststart", h264_path],
+                capture_output=True,
+            )
+            if enc.returncode != 0:
+                raise RuntimeError("ffmpeg re-encode failed: " + enc.stderr.decode()[-300:])
+            os.replace(h264_path, tmp_path)
+
+        final = os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4")
+        shutil.move(tmp_path, final)
+        return final
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+async def _on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    if not re.match(r"https?://", text):
+        return
+
+    name = _next_video_name()
+    msg = await update.message.reply_text(
+        f"⬇️ Downloading as *{name}*...", parse_mode="Markdown"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        final = await loop.run_in_executor(_executor, _download_url, text, name)
+        await msg.edit_text(
+            f"✅ *{name}* — Downloaded! Pipeline starting...", parse_mode="Markdown"
+        )
+        log.info(f"[download] {text} → {final}")
+    except Exception as e:
+        err = str(e)
+        log.error(f"[download] Failed: {err}")
+        is_instagram = "instagram.com" in text.lower()
+        is_timeout = "timed out" in err.lower() or "timeout" in err.lower()
+        is_bad_url = "unsupported url" in err.lower() or "falling back on generic" in err.lower()
+        needs_login = any(x in err.lower() for x in ["login", "empty media", "not granting", "cookies", "auth"])
+        if is_bad_url:
+            await msg.edit_text(
+                "⚠️ *That link isn't a video.*\n\n"
+                "Make sure you're sharing an actual video, not a profile page, homepage, or search result.\n\n"
+                "*How to get the right link:*\n"
+                "• TikTok — open a video → tap Share → Copy link\n"
+                "• Instagram — open a Reel → tap ··· → Copy link\n"
+                "• YouTube — open a video → tap Share → Copy link",
+                parse_mode="Markdown",
+            )
+        elif is_timeout:
+            await msg.edit_text(
+                "⏱ *Download timed out* (tried 3×)\n\n"
+                "TikTok/Instagram servers were slow. Options:\n\n"
+                "• *Try again* — paste the same link again\n"
+                "• *Send the file directly* — download on your phone and send here (up to 20 MB)",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔁 Retry same link", callback_data=f"retry_url:{text}"),
+                ]]),
+            )
+        elif is_instagram and needs_login:
+            await msg.edit_text(
+                "⚠️ *Instagram login required*\n\n"
+                "Instagram blocked the download because the bot isn't logged in.\n\n"
+                "*Option 1 — Quick fix:*\n"
+                "Download the reel to your phone → send the video file directly here (up to 20 MB)\n\n"
+                "*Option 2 — Permanent fix:*\n"
+                "Export your Instagram cookies and send the `cookies.txt` file to this bot. "
+                "It will work for all future Instagram links automatically.\n\n"
+                "See /help for cookie export instructions.",
+                parse_mode="Markdown",
+            )
+        else:
+            await msg.edit_text(f"❌ Download failed: `{err[:300]}`", parse_mode="Markdown")
+
+
+async def _on_retry_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Retry a timed-out URL download from the inline button."""
+    query = update.callback_query
+    await query.answer()
+    _, url = query.data.split(":", 1)
+
+    name = _next_video_name()
+    await _safe_edit(query, f"⬇️ Retrying download as *{name}*...", keyboard=None)
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(_executor, _download_url, url, name)
+        await _notify(f"✅ *{name}* — Downloaded! Pipeline starting...")
+        log.info(f"[download] retry succeeded: {url}")
+    except Exception as e:
+        err = str(e)
+        log.error(f"[download] retry failed: {err}")
+        is_timeout = "timed out" in err.lower() or "timeout" in err.lower()
+        if is_timeout:
+            await _notify(
+                f"⏱ *Still timing out.* TikTok servers may be slow right now.\n"
+                f"Download the video on your phone and send the file here instead."
+            )
+        else:
+            await _notify(f"❌ Download failed again: `{err[:200]}`")
+
+
+async def _on_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    tg_file = None
+    original_name = None
+
+    # Handle cookies.txt upload — saves it for yt-dlp Instagram auth
+    if msg.document and (msg.document.file_name or "").lower() == "cookies.txt":
+        reply = await msg.reply_text("🍪 Saving cookies...", parse_mode="Markdown")
+        try:
+            tg_cookies = await msg.document.get_file()
+            await tg_cookies.download_to_drive(COOKIES_FILE)
+            await reply.edit_text(
+                "✅ *Cookies saved!*\n\n"
+                "Instagram links will now download automatically. "
+                "Cookies stay on the server — just paste links as normal.",
+                parse_mode="Markdown",
+            )
+            log.info("Cookies file updated.")
+        except Exception as e:
+            await reply.edit_text(f"❌ Failed to save cookies: `{e}`", parse_mode="Markdown")
+        return
+
+    if msg.video:
+        tg_file = await msg.video.get_file()
+        original_name = msg.video.file_name or "upload.mp4"
+        file_size = msg.video.file_size or 0
+    elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("video/"):
+        tg_file = await msg.document.get_file()
+        original_name = msg.document.file_name or "upload.mp4"
+        file_size = msg.document.file_size or 0
+    else:
+        return
+
+    if file_size > 20 * 1024 * 1024:
+        await msg.reply_text(
+            f"⚠️ File is {file_size / 1_000_000:.0f} MB — Telegram bots can only receive files up to 20 MB.\n"
+            "Send a URL (TikTok / Instagram / YouTube) instead.",
+            parse_mode="Markdown",
+        )
+        return
+
+    name = _next_video_name()
+    reply = await msg.reply_text(f"⬇️ Receiving *{name}*...", parse_mode="Markdown")
+
+    import tempfile
+    tmp_dir = tempfile.mkdtemp()
+    ext = os.path.splitext(original_name)[1].lower() or ".mp4"
+    tmp_path = os.path.join(tmp_dir, f"{name}{ext}")
+
+    try:
+        await tg_file.download_to_drive(tmp_path)
+
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name",
+             "-of", "default=noprint_wrappers=1:nokey=1", tmp_path],
+            capture_output=True, text=True,
+        )
+        codec = probe.stdout.strip()
+        final_tmp = os.path.join(tmp_dir, f"{name}.mp4")
+
+        if codec != "h264" or ext != ".mp4":
+            await reply.edit_text(f"🔄 *{name}* — Converting to H.264...", parse_mode="Markdown")
+            loop = asyncio.get_running_loop()
+            enc_result = await loop.run_in_executor(
+                _executor,
+                lambda: subprocess.run(
+                    ["ffmpeg", "-y", "-i", tmp_path,
+                     "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                     "-c:a", "aac", "-movflags", "+faststart", final_tmp],
+                    capture_output=True,
+                ),
+            )
+            if enc_result.returncode != 0:
+                raise RuntimeError("ffmpeg re-encode failed: " + enc_result.stderr.decode()[-300:])
+        else:
+            os.rename(tmp_path, final_tmp)
+
+        dest = os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4")
+        shutil.move(final_tmp, dest)
+        await reply.edit_text(
+            f"✅ *{name}* — Saved! Pipeline starting...", parse_mode="Markdown"
+        )
+        log.info(f"[upload] Telegram video ({ext}, {codec}) → {dest}")
+
+    except Exception as e:
+        log.error(f"[upload] Failed: {e}")
+        await reply.edit_text(f"❌ Upload failed: `{e}`", parse_mode="Markdown")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+async def _on_hf_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
+    _cancelled.discard(name)
+    with _lock:
+        _processing.discard(name)
+
+    await query.edit_message_text(
+        f"🔄 *{name}* — Deleted old images. Regenerating...", parse_mode="Markdown"
+    )
+    asyncio.create_task(_do_higgsfield(name))
+
+
+async def _on_see_frame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    frame_path = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+    if not os.path.exists(frame_path):
+        await query.answer("⚠️ Frame not found.", show_alert=True)
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Try Different Frame", callback_data=f"frame_retry_full:{name}"),
+        InlineKeyboardButton("✅ Pick 1/2/3/4", callback_data=f"frame_pick:{name}"),
+    ]])
+    with open(frame_path, "rb") as f:
+        await _app.bot.send_photo(
+            chat_id=TELEGRAM_CHAT_ID,
+            photo=f,
+            caption=f"🖼 *{name}* — Extracted frame",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+
+async def _on_frame_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
+    _cancelled.discard(name)
+    with _lock:
+        _processing.discard(name)
+
+    await query.edit_message_caption(
+        f"✅ *{name}* — Frame confirmed! Regenerating images...", parse_mode="Markdown"
+    )
+    asyncio.create_task(_do_higgsfield(name))
+
+
+async def _on_frame_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    await query.edit_message_caption(
+        f"✅ *{name}* — Frame confirmed! Choose your image:", parse_mode="Markdown"
+    )
+    await _send_selection_prompt(name)
+
+
+async def _on_frame_retry_full(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete frame + all Higgsfield images, re-extract a different frame, regenerate."""
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    frame_path = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+    if os.path.exists(frame_path):
+        os.remove(frame_path)
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
+
+    _cancelled.discard(name)
+    with _lock:
+        _processing.discard(name)
+
+    try:
+        await query.edit_message_caption(
+            f"🔄 *{name}* — Trying a different frame and regenerating all images...",
+            parse_mode="Markdown",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    asyncio.create_task(_do_frame_extract(name))
+
+
+def _build_cancel_keyboard() -> tuple:
+    """Return (text, InlineKeyboardMarkup|None) for the cancel-video list."""
+    videos = sorted(glob.glob(os.path.join(RAW_MATERIAL_DIR, "*.mp4")))
+    if not videos:
+        return "📭 No videos in the pipeline to cancel.", None
+
+    buttons = []
+    for v in videos:
+        name = _vname(v)
+        if _has_output(name):
+            status = "✅ Done"
+        elif name in _processing:
+            status = _stage.get(name, "⚙️ Processing")
+        elif _has_selected(name):
+            status = "⏳ Wavespeed queued"
+        elif _has_higgsfield(name):
+            status = "👆 Awaiting pick"
+        elif _has_frame(name):
+            status = "⏸ Awaiting approval"
+        else:
+            status = _stage.get(name, "📥 Queued")
+        buttons.append([InlineKeyboardButton(
+            f"❌ {name} — {status}", callback_data=f"cancel_pick:{name}"
+        )])
+
+    buttons.append([InlineKeyboardButton("✖️ Never mind", callback_data="cancel_list_dismiss")])
+    return (
+        "*Which video do you want to cancel?*\n\nTap a video — you'll confirm before anything is deleted.",
+        InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _on_cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel command — show list of videos to cancel."""
+    text, keyboard = _build_cancel_keyboard()
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def _on_cancel_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """cancel_list button — edit current message to show the video list."""
+    query = update.callback_query
+    await query.answer()
+    text, keyboard = _build_cancel_keyboard()
+    await _safe_edit(query, text, keyboard=keyboard)
+
+
+async def _on_cancel_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User tapped a specific video — show confirmation before deleting."""
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    stage = _stage.get(name, "in pipeline")
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Yes, cancel & delete it", callback_data=f"cancel_do:{name}"),
+            InlineKeyboardButton("No, keep it", callback_data="cancel_list_dismiss"),
+        ]
+    ])
+    await _safe_edit(
+        query,
+        f"*Cancel {name}?*\n\nCurrent stage: {stage}\n\nThis stops processing and deletes the raw video, frame, and all generated images. It won't come back on restart.",
+        keyboard=keyboard,
+    )
+
+
+async def _on_cancel_do(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirmed — fully cancel and delete everything for this video."""
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    _cancelled.add(name)
+    with _lock:
+        _processing.discard(name)
+
+    for p in [
+        os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4"),
+        os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png"),
+    ]:
+        if os.path.exists(p):
+            os.remove(p)
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "wavespeed", name), ignore_errors=True)
+
+    _retry_counts.pop(name, None)
+    _stage.pop(name, None)
+
+    log.info(f"[{name}] Cancelled and deleted via cancel menu.")
+    await _safe_edit(
+        query,
+        f"🗑 *{name}* — Cancelled and deleted. All files removed, won't reappear on restart.",
+        keyboard=None,
+    )
+
+
+async def _on_cancel_list_dismiss(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await _safe_edit(query, "👍 No changes made.", keyboard=None)
+
+
+async def _on_action_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await _safe_edit(query, "🔍 Scanning queue...", keyboard=None)
+    asyncio.create_task(_startup_scan())
+
+
+async def _on_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    _retry_counts[name] = _retry_counts.get(name, 0) + 1
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
+    _cancelled.discard(name)
+    with _lock:
+        _processing.discard(name)
+
+    await query.edit_message_text(f"🔄 *{name}* — Retrying...", parse_mode="Markdown")
+    asyncio.create_task(_pipeline(name))
+
+
+async def _on_delete_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    raw_path = os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4")
+    frame_path = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+
+    for p in [raw_path, frame_path]:
+        if os.path.exists(p):
+            os.remove(p)
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
+
+    _retry_counts.pop(name, None)
+    _cancelled.discard(name)
+    _stage.pop(name, None)
+    with _lock:
+        _processing.discard(name)
+
+    log.info(f"[{name}] Deleted by user via bot.")
+    await query.edit_message_text(
+        f"🗑 *{name}* — Deleted. Raw video, frame, and generated images removed.",
+        parse_mode="Markdown",
+    )
+
+
+async def _on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cid = update.effective_chat.id
+    await update.message.reply_text(
+        f"👋 *Pipeline bot is live!*\n\n"
+        f"Your chat ID: `{cid}`\n\n"
+        f"*How to add a video:*\n"
+        f"• Paste a TikTok / Instagram / YouTube link\n"
+        f"• Or send a video file (up to 20 MB)\n\n"
+        f"/help — see all commands and buttons",
+        parse_mode="Markdown",
+    )
+
+
+async def _on_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cookies_status = "✅ Saved" if os.path.exists(COOKIES_FILE) else "❌ Not set"
+    await update.message.reply_text(
+        "🤖 *AI Influencer Bot — Help*\n\n"
+        "*How to add a video:*\n"
+        "• Paste a TikTok / Instagram / YouTube link\n"
+        "• Or send a video file directly (up to 20 MB)\n\n"
+        "*Pipeline steps:*\n"
+        "1️⃣ Frame extracted automatically\n"
+        "2️⃣ 4 AI images generated with live progress\n"
+        "3️⃣ You pick the best image (tap 1/2/3/4)\n"
+        "4️⃣ Final video → Telegram + Google Drive link\n\n"
+        "*Commands:*\n"
+        "/status — See all videos and their stage\n"
+        "/cancel — Cancel & delete a video from the queue\n"
+        "/help — Show this message\n\n"
+        "*Buttons:*\n"
+        "✅ Pick 1/2/3/4 — choose the best AI image\n"
+        "🖼 See Frame — view the extracted source frame\n"
+        "🔄 Try Different Frame — re-extract frame & regenerate all 4 images\n"
+        "🔄 Restart Gen — regenerate all 4 images (keep same frame)\n"
+        "🔄 Retry — retry after a failure\n"
+        "❌ Cancel — stop processing and clean up\n\n"
+        f"*Instagram cookies:* {cookies_status}\n"
+        "To fix Instagram download errors:\n"
+        "1. Open Chrome → instagram.com (logged in)\n"
+        "2. Install extension: *Get cookies.txt LOCALLY*\n"
+        "3. Click extension → Export → save as `cookies.txt`\n"
+        "4. Send that file to this bot\n"
+        "Done — all Instagram links work from then on.",
+        parse_mode="Markdown",
+    )
+
+
+async def _on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    videos = sorted(glob.glob(os.path.join(RAW_MATERIAL_DIR, "*.mp4")))
+    if not videos:
+        await update.message.reply_text(
+            "📭 *Queue is empty.*\n\nSend a URL or video file to get started!",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = ["*Pipeline Status*\n"]
+    for v in videos:
+        name = _vname(v)
+        if _has_output(name):
+            s = "✅ Done"
+        elif _has_selected(name):
+            s = "⚡ Wavespeed running"
+        elif _has_higgsfield(name):
+            s = _stage.get(name, "👆 Waiting for image pick")
+        elif _has_frame(name):
+            s = _stage.get(name, "⏸ Waiting for frame approval")
+        else:
+            s = _stage.get(name, "📥 Extracting frame")
+        lines.append(f"• `{name}`: {s}")
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel a Video", callback_data="cancel_list"),
+    ]])
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=keyboard
+    )
+
+
+# ── Watchdog ──────────────────────────────────────────────────────────────────
+
+class _VideoWatcher(FileSystemEventHandler):
+    def _enqueue(self, path: str) -> None:
+        if not path.lower().endswith(".mp4"):
+            return
+        name = _vname(path)
+        log.info(f"[watchdog] Detected: {os.path.basename(path)}")
+        asyncio.run_coroutine_threadsafe(_pipeline(name), _loop)
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._enqueue(event.src_path)
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._enqueue(event.dest_path)
+
+
+# ── Startup scan ──────────────────────────────────────────────────────────────
+
+async def _startup_scan() -> None:
+    videos = sorted(glob.glob(os.path.join(RAW_MATERIAL_DIR, "*.mp4")))
+
+    if not videos:
+        await _notify(
+            "📭 *Queue is empty.*\n\n"
+            "Send a TikTok / Instagram link, or upload a video file directly here."
+        )
+        return
+
+    # Build an instant summary so the user gets a response immediately
+    lines = [f"📋 Found *{len(videos)}* video(s):\n"]
+    pending = []
+
+    for v in videos:
+        name = _vname(v)
+        if _has_output(name):
+            lines.append(f"• `{name}` — ✅ Already done")
+        elif _has_selected(name):
+            lines.append(f"• `{name}` — ⚡ Resuming Wavespeed")
+            pending.append(("wavespeed", name))
+        elif _has_higgsfield(name):
+            lines.append(f"• `{name}` — 👆 Needs image pick")
+            pending.append(("pick", name))
+        elif _has_frame(name):
+            lines.append(f"• `{name}` — 🎨 Generating images...")
+            pending.append(("higgsfield_auto", name))
+        else:
+            lines.append(f"• `{name}` — 📥 Queued for processing")
+            pending.append(("pipeline", name))
+
+    await _notify("\n".join(lines))
+
+    # Now kick off background work — files are already on disk so skip stability wait
+    for kind, name in pending:
+        if kind == "wavespeed":
+            asyncio.create_task(_do_wavespeed(name))
+        elif kind == "pick":
+            with _lock:
+                _processing.add(name)
+            await _send_selection_prompt(name)
+        elif kind == "higgsfield_auto":
+            with _lock:
+                _processing.add(name)
+            asyncio.create_task(_do_higgsfield(name))
+        else:
+            asyncio.create_task(_pipeline(name, stable=True))
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    global _loop, _app
+
+    _acquire_pid_lock()
+
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN must be set in config.py")
+
+    if not TELEGRAM_CHAT_ID:
+        log.warning("TELEGRAM_CHAT_ID not set — send /start to your bot to get it.")
+
+    _loop = asyncio.get_running_loop()
+
+    _app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Commands
+    _app.add_handler(CommandHandler("start",  _on_start))
+    _app.add_handler(CommandHandler("status", _on_status))
+    _app.add_handler(CommandHandler("help",   _on_help))
+    _app.add_handler(CommandHandler("cancel", _on_cancel_cmd))
+
+    # Callback buttons — order matters: more specific patterns first
+    _app.add_handler(CallbackQueryHandler(_on_frame_approve,      pattern=r"^frame_approve:"))
+    _app.add_handler(CallbackQueryHandler(_on_frame_retry_new,    pattern=r"^frame_retry:"))
+    _app.add_handler(CallbackQueryHandler(_on_cancel,             pattern=r"^cancel:"))
+    _app.add_handler(CallbackQueryHandler(_on_cancel_list,        pattern=r"^cancel_list$"))
+    _app.add_handler(CallbackQueryHandler(_on_cancel_pick,        pattern=r"^cancel_pick:"))
+    _app.add_handler(CallbackQueryHandler(_on_cancel_do,          pattern=r"^cancel_do:"))
+    _app.add_handler(CallbackQueryHandler(_on_cancel_list_dismiss, pattern=r"^cancel_list_dismiss$"))
+    _app.add_handler(CallbackQueryHandler(_on_pick,               pattern=r"^sel:"))
+    _app.add_handler(CallbackQueryHandler(_on_retry,              pattern=r"^retry:"))
+    _app.add_handler(CallbackQueryHandler(_on_delete_video,       pattern=r"^delete_video:"))
+    _app.add_handler(CallbackQueryHandler(_on_hf_restart,         pattern=r"^hf_restart:"))
+    _app.add_handler(CallbackQueryHandler(_on_see_frame,          pattern=r"^see_frame:"))
+    _app.add_handler(CallbackQueryHandler(_on_frame_ok,           pattern=r"^frame_ok:"))
+    _app.add_handler(CallbackQueryHandler(_on_frame_pick,         pattern=r"^frame_pick:"))
+    _app.add_handler(CallbackQueryHandler(_on_frame_retry_full,   pattern=r"^frame_retry_full:"))
+    _app.add_handler(CallbackQueryHandler(_on_action_start,       pattern=r"^action:start$"))
+    _app.add_handler(CallbackQueryHandler(_on_retry_url,          pattern=r"^retry_url:"))
+
+    # Messages
+    _app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, _on_video_upload))
+    _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_url))
+
+    observer = Observer()
+    observer.schedule(_VideoWatcher(), RAW_MATERIAL_DIR, recursive=False)
+    observer.start()
+    log.info(f"[watchdog] Watching: {RAW_MATERIAL_DIR}")
+
+    await _app.initialize()
+    await _app.start()
+    await _app.updater.start_polling(drop_pending_updates=True)
+    log.info("[bot] Telegram polling started")
+
+    if TELEGRAM_CHAT_ID:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Start", callback_data="action:start")],
+            [InlineKeyboardButton("❌ Cancel a Video", callback_data="cancel_list")],
+        ])
+        await _app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=(
+                "🚀 *Pipeline bot is live!*\n\n"
+                "Send me a TikTok / Instagram link\n"
+                "or upload a video file directly.\n\n"
+                "I'll guide you through every step with buttons.\n\n"
+                "/help — all commands\n"
+                "/status — current pipeline\n"
+                "/cancel — cancel & delete a video\n\n"
+                "Tap *Start* to scan for existing videos."
+            ),
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+    else:
+        log.info("[bot] Waiting for chat ID — send /start to your bot in Telegram.")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        observer.stop()
+        observer.join()
+        await _app.updater.stop()
+        await _app.stop()
+        await _app.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
