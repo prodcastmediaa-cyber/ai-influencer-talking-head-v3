@@ -1,6 +1,20 @@
 #!/bin/bash
-# Stop the AI Influencer bot cleanly
+# Stop the AI Influencer bot cleanly.
 cd "$(dirname "$0")"
+
+SERVICE="com.aiinfluencer.watcher"
+PLIST="$HOME/Library/LaunchAgents/${SERVICE}.plist"
+
+if [ -f "$PLIST" ]; then
+    echo "Unloading launchctl service..."
+    launchctl unload "$PLIST" 2>/dev/null || true
+    pkill -f "python3.*watcher\.py" 2>/dev/null || true
+    rm -f .watcher.pid
+    echo "Bot stopped."
+    exit 0
+fi
+
+# ── Fallback: direct kill ────────────────────────────────────────────────────
 
 PID_FILE=".watcher.pid"
 
@@ -17,7 +31,6 @@ if [ -f "$PID_FILE" ]; then
     fi
     rm -f "$PID_FILE"
 else
-    # Fallback: kill by name
     if pkill -f "python3.*watcher\.py" 2>/dev/null; then
         echo "Bot stopped."
     else

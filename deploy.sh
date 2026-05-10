@@ -69,6 +69,8 @@ rsync -avz --progress \
   --exclude '.git' \
   --exclude 'outputs/' \
   --exclude 'watcher.log' \
+  --exclude 'watcher_error.log' \
+  --exclude '.watcher.pid' \
   --exclude 'extracted frames/' \
   --exclude 'raw material/' \
   --exclude '.DS_Store' \

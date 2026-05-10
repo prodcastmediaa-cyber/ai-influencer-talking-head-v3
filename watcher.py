@@ -372,12 +372,18 @@ async def _do_higgsfield(name: str) -> None:
         InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{name}")
     ]])
 
-    progress_msg = await _app.bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=f"🎨 *{name}* — Generating images... [░░░░] 0/4",
-        parse_mode="Markdown",
-        reply_markup=cancel_kb,
-    )
+    try:
+        progress_msg = await _app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=f"🎨 *{name}* — Generating images... [░░░░] 0/4",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb,
+        )
+    except Exception as e:
+        log.error(f"[{name}] Could not send Higgsfield progress message: {e}")
+        with _lock:
+            _processing.discard(name)
+        return
     _stage[name] = "🎨 Generating images (0/4)"
 
     def _on_progress(count: int):
