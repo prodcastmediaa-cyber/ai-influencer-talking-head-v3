@@ -1290,8 +1290,16 @@ async def _on_clean_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _show_clean_prompt(query.message.reply_text)
 
 
-def _do_clean_sync() -> dict:
-    """Blocking file deletion — runs in a thread executor from _do_clean()."""
+async def _do_clean() -> dict:
+    """Wipe all pipeline files and cancel all in-progress jobs. Returns counts."""
+    with _lock:
+        for name in list(_processing):
+            _cancelled.add(name)
+        _processing.clear()
+    _stage.clear()
+    _retry_counts.clear()
+    _cancelled.clear()
+
     deleted = {"videos": 0, "frames": 0, "hf": 0, "ws": 0}
 
     for f in glob.glob(os.path.join(RAW_MATERIAL_DIR, "*.mp4")):
@@ -1308,6 +1316,10 @@ def _do_clean_sync() -> dict:
         except OSError:
             pass
 
+    # Clean up temp dirs left behind by interrupted frame extractions
+    for d in glob.glob(os.path.join(EXTRACTED_FRAMES_DIR, "_tmp_*")):
+        shutil.rmtree(d, ignore_errors=True)
+
     for d in glob.glob(os.path.join(OUTPUTS_DIR, "higgsfield", "*")):
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
@@ -1318,22 +1330,6 @@ def _do_clean_sync() -> dict:
             shutil.rmtree(d, ignore_errors=True)
             deleted["ws"] += 1
 
-    return deleted
-
-
-async def _do_clean() -> dict:
-    """Wipe all pipeline files and cancel all in-progress jobs. Returns counts."""
-    with _lock:
-        for name in list(_processing):
-            _cancelled.add(name)
-        _processing.clear()
-    _stage.clear()
-    _retry_counts.clear()
-
-    loop = asyncio.get_running_loop()
-    deleted = await loop.run_in_executor(_executor, _do_clean_sync)
-
-    _cancelled.clear()
     return deleted
 
 
