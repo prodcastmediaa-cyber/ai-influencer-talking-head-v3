@@ -403,15 +403,24 @@ async def _do_higgsfield(name: str) -> None:
         except Exception:
             pass
 
+    hf_error: str = ""
     try:
         await loop.run_in_executor(_executor, _step2_higgsfield, name, _on_progress)
     except Exception as e:
+        hf_error = str(e)
         log.exception(f"[{name}] Higgsfield error")
 
     if name in _cancelled:
         return
 
     if not _has_higgsfield(name):
+        # Surface the real error — auth failures were previously shown as "NSFW"
+        if "not authenticated" in hf_error.lower() or "auth login" in hf_error.lower():
+            reason = "Higgsfield CLI not authenticated. SSH into the VPS and run: `higgsfield auth login`"
+        elif hf_error:
+            reason = f"Higgsfield error: `{hf_error[:200]}`"
+        else:
+            reason = "All 4 Higgsfield jobs failed — check VPS journal: `journalctl -u ai-influencer -n 50`"
         try:
             await progress_msg.edit_text(
                 f"❌ *{name}* — Image generation failed.",
@@ -420,7 +429,7 @@ async def _do_higgsfield(name: str) -> None:
             )
         except Exception:
             pass
-        await _send_failure_actions(name, "Higgsfield failed (NSFW or API error).")
+        await _send_failure_actions(name, reason)
         with _lock:
             _processing.discard(name)
         return

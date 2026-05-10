@@ -48,8 +48,12 @@ def run_generation(frame_path, output_dir, index):
     )
 
     if result.returncode != 0:
-        err = (result.stderr.strip() or result.stdout.strip())[:300]
+        err = (result.stderr.strip() or result.stdout.strip())[:400]
         print(f"  [Job {index+1}] CLI error (exit {result.returncode}): {err}")
+        if "not authenticated" in err.lower() or "auth login" in err.lower():
+            raise RuntimeError(
+                f"Higgsfield CLI not authenticated — run: higgsfield auth login\n{err}"
+            )
         return None
 
     try:
