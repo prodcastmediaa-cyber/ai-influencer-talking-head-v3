@@ -26,6 +26,10 @@ OUTPUTS_DIR          = os.path.join(BASE_DIR, "outputs")
 # This is the identity source: face, skin tone, hair, and overall look.
 MIA_REFERENCE_IMAGE = os.path.join(CHARACTER_REF_DIR, "character-main.png")
 
+# ─── OpenAI (GPT-4o frame analysis) ──────────────────────────────────────────
+# Get your key from: https://platform.openai.com → API Keys
+OPENAI_API_KEY = "YOUR_OPENAI_API_KEY_HERE"
+
 # ─── Higgsfield ───────────────────────────────────────────────────────────────
 # Get your key from: https://higgsfield.ai → Settings → API
 # Also install the CLI: pip install higgsfield

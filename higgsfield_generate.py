@@ -1,44 +1,84 @@
 """
-Generates 4 images using Higgsfield Nano Banana Pro.
-Image 1: Mia reference (character appearance)
-Image 2: Extracted scene frame (pose, outfit, background)
+Generates 4 images using Higgsfield Soul Character 2.0.
+Step 1: Analyze extracted frame with GPT-4o → structured prompt
+Step 2: Generate with Soul V2 using character reference + LLM prompt
 """
 import subprocess
 import os
 import json
 import glob
+import base64
 import requests
 import concurrent.futures
+from openai import OpenAI
 from config import (
     MIA_REFERENCE_IMAGE,
     EXTRACTED_FRAMES_DIR,
     OUTPUTS_DIR,
+    OPENAI_API_KEY,
 )
 
-PROMPT = (
-    "The character from image 1 placed into the exact scene from image 2. "
-    "Use image 2 for all scene details: background, location, clothing, body pose, lighting, and composition. "
-    "Use image 1 only for the face and identity. "
-    "Photorealistic, sharp focus, high detail, 9:16 vertical."
-)
-
-MODEL       = "nano_banana_2"
-ASPECT      = "9:16"
-RESOLUTION  = "2k"
+MODEL       = "text2image_soul_v2"
 NUM_OUTPUTS = 4
 
+HAIR_DESCRIPTION = (
+    "long natural jet-black hair with soft cool undertones, rich deep black tone, "
+    "subtle espresso sheen under light, smooth realistic texture, soft dimensional shine, "
+    "healthy silky finish, natural dark brunette-black blend with effortless depth"
+)
 
-def run_generation(frame_path, output_dir, index):
+_FRAME_ANALYSIS_PROMPT = (
+    "Analyze this video frame and write a structured image generation prompt in EXACTLY this format. "
+    "Output only the prompt text, nothing else — no preamble, no explanation.\n\n"
+    "Pose:\n"
+    "[body position, stance, angle, movement, gesture]\n\n"
+    "Environment:\n"
+    "[location, setting, time of day, lighting, atmosphere]\n\n"
+    "Clothing:\n"
+    "[outfit and accessories], " + HAIR_DESCRIPTION + "\n\n"
+    "Camera:\n"
+    "[camera angle, shot type, distance, lens feel, style]\n\n"
+    "Extra:\n"
+    "use reference soul character strictly, preserve exact face and identity, "
+    "natural skin texture, subtle eyeliner, light blush, soft nude lips, "
+    "realistic human details, no tattoos, avoid overly shiny skin"
+)
+
+
+def analyze_frame(frame_path: str) -> str:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    with open(frame_path, "rb") as f:
+        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        max_tokens=600,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{image_data}",
+                        "detail": "high",
+                    },
+                },
+                {"type": "text", "text": _FRAME_ANALYSIS_PROMPT},
+            ],
+        }],
+    )
+    prompt = response.choices[0].message.content.strip()
+    print(f"  [GPT-4o] Generated prompt:\n{prompt}\n")
+    return prompt
+
+
+def run_generation(output_dir, index, prompt):
     print(f"  [Job {index+1}/{NUM_OUTPUTS}] Submitting...")
 
     result = subprocess.run(
         [
             "higgsfield", "generate", "create", MODEL,
             "--image", MIA_REFERENCE_IMAGE,
-            "--image", frame_path,
-            "--prompt", PROMPT,
-            "--aspect_ratio", ASPECT,
-            "--resolution", RESOLUTION,
+            "--prompt", prompt,
             "--wait",
             "--json",
         ],
@@ -101,15 +141,18 @@ def generate_for_video(frame_path, on_progress=None):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"\nGenerating {NUM_OUTPUTS} outputs for: {video_name}")
+    print(f"\nAnalyzing frame with GPT-4o: {video_name}")
+    prompt = analyze_frame(frame_path)
+
+    print(f"Generating {NUM_OUTPUTS} outputs for: {video_name}")
     print(f"  Character ref: {MIA_REFERENCE_IMAGE}")
-    print(f"  Scene frame:   {frame_path}")
+    print(f"  Model:         {MODEL}")
     print(f"  Output dir:    {output_dir}")
 
     saved = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_OUTPUTS) as ex:
         futures = {
-            ex.submit(run_generation, frame_path, output_dir, i): i
+            ex.submit(run_generation, output_dir, i, prompt): i
             for i in range(NUM_OUTPUTS)
         }
         for future in concurrent.futures.as_completed(futures):
