@@ -7,15 +7,14 @@ import subprocess
 import os
 import json
 import glob
-import base64
 import requests
 import concurrent.futures
-from openai import OpenAI
+import google.generativeai as genai
 from config import (
     MIA_REFERENCE_IMAGE,
     EXTRACTED_FRAMES_DIR,
     OUTPUTS_DIR,
-    OPENAI_API_KEY,
+    GEMINI_API_KEY,
 )
 
 MODEL       = "text2image_soul_v2"
@@ -46,28 +45,14 @@ _FRAME_ANALYSIS_PROMPT = (
 
 
 def analyze_frame(frame_path: str) -> str:
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
     with open(frame_path, "rb") as f:
-        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        max_tokens=600,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{image_data}",
-                        "detail": "high",
-                    },
-                },
-                {"type": "text", "text": _FRAME_ANALYSIS_PROMPT},
-            ],
-        }],
-    )
-    prompt = response.choices[0].message.content.strip()
-    print(f"  [GPT-4o] Generated prompt:\n{prompt}\n")
+        image_bytes = f.read()
+    image_part = {"mime_type": "image/png", "data": image_bytes}
+    response = model.generate_content([image_part, _FRAME_ANALYSIS_PROMPT])
+    prompt = response.text.strip()
+    print(f"  [Gemini Flash] Generated prompt:\n{prompt}\n")
     return prompt
 
 
