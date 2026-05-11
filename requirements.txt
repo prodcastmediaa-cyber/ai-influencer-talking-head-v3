@@ -9,4 +9,3 @@ watchdog==4.0.1
 yt-dlp
 mediapipe
 opencv-python-headless
-google-generativeai

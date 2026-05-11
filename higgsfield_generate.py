@@ -1,7 +1,7 @@
 """
 Generates 4 images using Higgsfield Soul Character 2.0.
-Step 1: Analyze extracted frame with GPT-4o → structured prompt
-Step 2: Generate with Soul V2 using character reference + LLM prompt
+Step 1: Analyze extracted frame locally with OpenCV → structured prompt
+Step 2: Generate with Soul V2 using character reference + prompt
 """
 import subprocess
 import os
@@ -9,12 +9,12 @@ import json
 import glob
 import requests
 import concurrent.futures
-import google.generativeai as genai
+import cv2
+import numpy as np
 from config import (
     MIA_REFERENCE_IMAGE,
     EXTRACTED_FRAMES_DIR,
     OUTPUTS_DIR,
-    GEMINI_API_KEY,
 )
 
 MODEL       = "text2image_soul_v2"
@@ -26,18 +26,7 @@ HAIR_DESCRIPTION = (
     "healthy silky finish, natural dark brunette-black blend with effortless depth"
 )
 
-_FRAME_ANALYSIS_PROMPT = (
-    "Analyze this video frame and write a structured image generation prompt in EXACTLY this format. "
-    "Output only the prompt text, nothing else — no preamble, no explanation.\n\n"
-    "Pose:\n"
-    "[body position, stance, angle, movement, gesture]\n\n"
-    "Environment:\n"
-    "[location, setting, time of day, lighting, atmosphere]\n\n"
-    "Clothing:\n"
-    "[outfit and accessories], " + HAIR_DESCRIPTION + "\n\n"
-    "Camera:\n"
-    "[camera angle, shot type, distance, lens feel, style]\n\n"
-    "Extra:\n"
+_EXTRA = (
     "use reference soul character strictly, preserve exact face and identity, "
     "natural skin texture, subtle eyeliner, light blush, soft nude lips, "
     "realistic human details, no tattoos, avoid overly shiny skin"
@@ -45,14 +34,65 @@ _FRAME_ANALYSIS_PROMPT = (
 
 
 def analyze_frame(frame_path: str) -> str:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    with open(frame_path, "rb") as f:
-        image_bytes = f.read()
-    image_part = {"mime_type": "image/png", "data": image_bytes}
-    response = model.generate_content([image_part, _FRAME_ANALYSIS_PROMPT])
-    prompt = response.text.strip()
-    print(f"  [Gemini Flash] Generated prompt:\n{prompt}\n")
+    """Analyze frame with OpenCV — no API needed."""
+    img = cv2.imread(frame_path)
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Brightness → lighting description
+    brightness = float(gray.mean())
+    if brightness > 170:
+        lighting = "bright natural daylight, high-key lighting, airy atmosphere"
+    elif brightness > 110:
+        lighting = "soft diffused daylight, balanced natural exposure"
+    elif brightness > 70:
+        lighting = "warm indoor lighting, golden hour feel, cozy ambiance"
+    else:
+        lighting = "moody low-key lighting, dramatic shadows, cinematic feel"
+
+    # Color temperature → warm vs cool tones
+    b_ch, g_ch, r_ch = cv2.split(img)
+    tone = "warm golden tones" if float(r_ch.mean()) > float(b_ch.mean()) else "cool blue-toned palette"
+
+    # Background complexity → simple vs busy
+    edges = cv2.Canny(gray, 100, 200)
+    complex_bg = float(edges.mean()) > 12
+    environment = (
+        "dynamic urban environment with architectural details in background"
+        if complex_bg else
+        "clean minimal background, uncluttered modern setting"
+    )
+
+    # Face position → shot framing
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
+    if len(faces) > 0:
+        fx, fy, fw, fh = faces[0]
+        face_y = (fy + fh / 2) / h
+    else:
+        face_y = 0.35
+
+    if face_y < 0.35:
+        pose = "close-up portrait, face and upper chest visible, slight angle to camera, natural expression"
+        camera = "tight portrait shot, eye-level, 85mm lens feel, shallow bokeh"
+    elif face_y < 0.55:
+        pose = "medium shot, upper body fully visible, relaxed confident posture, natural stance"
+        camera = "medium portrait, eye-level angle, 50mm lens feel, soft background blur"
+    else:
+        pose = "full body shot, confident standing pose, slight three-quarter angle, dynamic presence"
+        camera = "full body portrait, slight low angle, 35mm lens feel, cinematic framing"
+
+    prompt = (
+        f"Pose:\n{pose}\n\n"
+        f"Environment:\n{environment}, {lighting}, {tone}\n\n"
+        f"Clothing:\nstylish contemporary outfit suited to the scene, {HAIR_DESCRIPTION}\n\n"
+        f"Camera:\n{camera}, 9:16 vertical, sharp focus on subject, professional quality\n\n"
+        f"Extra:\n{_EXTRA}"
+    )
+    print(f"  [OpenCV] brightness={brightness:.0f}, complex_bg={complex_bg}, face_y={face_y:.2f}")
+    print(f"  [OpenCV] Prompt:\n{prompt}\n")
     return prompt
 
 
@@ -126,7 +166,7 @@ def generate_for_video(frame_path, on_progress=None):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"\nAnalyzing frame with GPT-4o: {video_name}")
+    print(f"\nAnalyzing frame (OpenCV): {video_name}")
     prompt = analyze_frame(frame_path)
 
     print(f"Generating {NUM_OUTPUTS} outputs for: {video_name}")
