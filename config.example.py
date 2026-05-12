@@ -2,7 +2,7 @@ import os
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ─── Google Sheet ──────────────────────────────────────────────────────────────
+# ─── Google Sheet (optional) ──────────────────────────────────────────────────
 # The ID is the long string in your Google Sheet URL:
 # https://docs.google.com/spreadsheets/d/<THIS_PART>/edit
 SHEET_ID   = "YOUR_GOOGLE_SHEET_ID_HERE"
@@ -21,16 +21,26 @@ CHARACTER_REF_DIR    = os.path.join(BASE_DIR, "character sheet")
 EXTRACTED_FRAMES_DIR = os.path.join(BASE_DIR, "extracted frames")
 OUTPUTS_DIR          = os.path.join(BASE_DIR, "outputs")
 
-# ─── Your AI Character reference image ────────────────────────────────────────
-# Place your character's reference photo here.
-# This is the identity source: face, skin tone, hair, and overall look.
-MIA_REFERENCE_IMAGE = os.path.join(CHARACTER_REF_DIR, "character-main.png")
-
 # ─── Higgsfield ───────────────────────────────────────────────────────────────
 # Get your key from: https://higgsfield.ai → Settings → API
-# Also install the CLI: pip install higgsfield
-# And log in:          higgsfield auth login
+# Also install the CLI:  pip install higgsfield
+# And log in:            higgsfield auth login
 HIGGSFIELD_API_KEY = "YOUR_HIGGSFIELD_API_KEY_HERE"
+
+# ─── Your AI Character — Soul ID ──────────────────────────────────────────────
+# This is the ID of the Soul Character you trained in Higgsfield.
+# How to get it:
+#   1. Go to higgsfield.ai → Soul Characters
+#   2. Train a new character with 5–20 reference photos (takes ~10 min)
+#   3. Once status shows "Ready", open the character → copy its Soul ID (a UUID)
+#   4. Paste it below
+#
+# Example: "dc1b8265-abe1-41d4-9cf4-518c52bf2c82"
+MIA_SOUL_ID = "YOUR_SOUL_ID_HERE"
+
+# If you have multiple characters, add them here and swap MIA_SOUL_ID as needed:
+# SCAR_SOUL_ID          = "YOUR_SECOND_SOUL_ID_HERE"
+# SUNLIT_EMBRACE_SOUL_ID = "YOUR_THIRD_SOUL_ID_HERE"
 
 # ─── Wavespeed (Kling Motion Control) ─────────────────────────────────────────
 # Get your key from: https://wavespeed.ai → Dashboard → API Keys

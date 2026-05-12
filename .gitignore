@@ -5,11 +5,7 @@ config.py
 cookies.txt
 
 # ─── Character reference images — add your own, don't commit others' ──────────
-character sheet/*.png
-character sheet/*.jpg
-character sheet/*.jpeg
-character sheet/*.webp
-character sheet/*.gif
+character sheet*/
 
 # ─── Large media — store separately (too large for git) ───────────────────────
 raw material/

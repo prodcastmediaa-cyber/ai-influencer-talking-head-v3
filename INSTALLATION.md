@@ -7,8 +7,8 @@
 ## What You Will Need
 
 Before starting, make sure you have accounts at:
-- [Higgsfield](https://higgsfield.ai) — for AI character image generation
-- [Wavespeed](https://wavespeed.ai) — for video generation
+- [Higgsfield](https://higgsfield.ai) — for AI character image generation (Soul Character 2.0)
+- [Wavespeed](https://wavespeed.ai) — for video generation (Kling 2.6 Pro)
 - [Telegram](https://telegram.org) — for the bot (optional but recommended)
 - [Google Cloud](https://console.cloud.google.com) — for Sheets + Drive tracking (optional)
 
@@ -161,7 +161,7 @@ bash setup.sh
    ```bash
    higgsfield auth login
    ```
-   Follow the browser prompt to authenticate.
+   A browser window opens — log in with your Higgsfield account.
 
 #### Wavespeed API Key
 
@@ -170,9 +170,40 @@ bash setup.sh
 
 ---
 
-### Step 9 — Configure Your Keys
+### Step 9 — Train Your AI Character (Soul Character 2.0)
 
-Open `config.py` (created by setup.sh) and fill in the values:
+This is the most important step. You are training a "Soul" — a reusable AI identity that Higgsfield will use to generate your character's face in every video.
+
+**What you need:**
+- 5 to 20 photos of your character (or yourself, or any person/persona you want to use)
+- Photos should show the face clearly from different angles, in different lighting, with different expressions
+- Avoid heavy filters, sunglasses, or anything that hides the face
+
+**How to train:**
+
+1. Go to [higgsfield.ai](https://higgsfield.ai) and log in
+2. In the left sidebar, click **Soul Characters**
+3. Click **+ New Character** (or **Train New Soul**)
+4. Give your character a name (e.g. "Mia")
+5. Upload your 5–20 reference photos
+6. Click **Start Training**
+7. Training takes approximately 5–15 minutes. You can close the tab — Higgsfield will notify you when it's done.
+
+**Get your Soul ID:**
+
+Once training completes and the status shows **Ready**:
+
+1. Click on your character in the Soul Characters list
+2. Look for the **Soul ID** — it is a long string like: `dc1b8265-abe1-41d4-9cf4-518c52bf2c82`
+3. Copy it — you will paste it into `config.py` in the next step
+
+> If you have multiple characters (e.g. two different influencers), train each one separately and note their Soul IDs. You can swap between them by changing `MIA_SOUL_ID` in `config.py`.
+
+---
+
+### Step 10 — Configure Your Keys
+
+Open `config.py` (created by setup.sh) in a text editor:
 
 ```bash
 # Open in VS Code:
@@ -182,27 +213,17 @@ code config.py
 open -e config.py
 ```
 
-Fill in:
+Fill in all the values:
+
 ```python
-HIGGSFIELD_API_KEY = "paste-your-higgsfield-key-here"
-WAVESPEED_API_KEY  = "paste-your-wavespeed-key-here"
+HIGGSFIELD_API_KEY = "paste-your-higgsfield-api-key-here"
+
+MIA_SOUL_ID = "paste-your-soul-id-here"   # the UUID from Step 9
+
+WAVESPEED_API_KEY = "paste-your-wavespeed-key-here"
 ```
 
-Save the file.
-
----
-
-### Step 10 — Add Your AI Character Reference Image
-
-1. Create your AI character in Higgsfield (follow their guide for training a Soul ID or use a reference photo)
-2. Export or save the best reference image of your character (good face visibility, clean background preferred)
-3. Place it at:
-   ```
-   character sheet/character-main.png
-   ```
-   The `character sheet/` folder was created by `setup.sh`.
-
-This is the identity source — every generated image will use this face, skin tone, and hair.
+Save the file. **Never commit this file to GitHub** — it is already in `.gitignore`.
 
 ---
 
@@ -215,11 +236,11 @@ python3 run_pipeline.py
 ```
 
 It will:
-1. Extract the best frame (takes ~30 seconds)
-2. Generate 4 images via Higgsfield (takes 2–4 minutes)
+1. Extract the best frame from the video (~30 seconds)
+2. Generate 4 images of your character placed in that scene using Higgsfield Soul Character 2.0 (2–4 minutes)
 3. Pause and ask you to pick the best image
 
-Open `outputs/higgsfield/{video_name}/` in Finder, pick the best one, copy it and name it `selected.png` in the same folder.
+Open `outputs/higgsfield/{video_name}/` in Finder, pick the best one, copy it and rename the copy to `selected.png` in the same folder.
 
 Then run again:
 ```bash
@@ -341,8 +362,7 @@ WSL lets you run Linux inside Windows. Once set up, follow the Mac/Linux steps a
 5. Clone the repo using Git Bash or PowerShell
 6. Instead of `bash setup.sh`, run the setup steps manually:
    ```powershell
-   # In PowerShell or Command Prompt:
-   mkdir "raw material" "extracted frames" "outputs\higgsfield" "outputs\wavespeed" "character sheet"
+   mkdir "raw material", "extracted frames", "outputs\higgsfield", "outputs\wavespeed", "character sheet"
    pip install -r requirements.txt
    copy config.example.py config.py
    ```
@@ -393,6 +413,12 @@ Delete `token.pickle` and run `python3 setup_sheet.py` again to re-authenticate.
 
 **The Telegram bot isn't responding**
 Check `watcher.log` with `tail -f watcher.log`. The most common causes are a wrong bot token or chat ID in `config.py`.
+
+**Soul Character generates a random person, not my character**
+Make sure `MIA_SOUL_ID` in `config.py` matches the Soul ID shown in Higgsfield → Soul Characters exactly. It must be the UUID (e.g. `dc1b8265-abe1-41d4-9cf4-518c52bf2c82`), not the character name.
+
+**Soul Character status is still "Training"**
+Training takes 5–15 minutes. Wait until the status shows "Ready" before copying the Soul ID and running the pipeline.
 
 **Higgsfield generates blank / rejected images**
 The model may have flagged the content. Try a different source video frame with less skin exposure or a more neutral pose.
