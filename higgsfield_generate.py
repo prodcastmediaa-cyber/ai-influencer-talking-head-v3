@@ -12,18 +12,13 @@ import cv2
 import numpy as np
 from config import (
     MIA_SOUL_ID,
+    CHARACTER_HAIR_DESCRIPTION,
     EXTRACTED_FRAMES_DIR,
     OUTPUTS_DIR,
 )
 
 MODEL       = "text2image_soul_v2"
 NUM_OUTPUTS = 4
-
-HAIR_DESCRIPTION = (
-    "long natural jet-black hair with soft cool undertones, rich deep black tone, "
-    "subtle espresso sheen under light, smooth realistic texture, soft dimensional shine, "
-    "healthy silky finish, natural dark brunette-black blend with effortless depth"
-)
 
 _EXTRA = (
     "use reference soul character strictly, preserve exact face and identity, "
@@ -81,7 +76,7 @@ def analyze_frame(frame_path: str) -> str:
     prompt = (
         f"Pose:\n{pose}\n\n"
         f"Environment:\n{environment}, {lighting}, {tone}\n\n"
-        f"Clothing:\nstylish contemporary outfit suited to the scene, {HAIR_DESCRIPTION}\n\n"
+        f"Clothing:\nstylish contemporary outfit suited to the scene, {CHARACTER_HAIR_DESCRIPTION}\n\n"
         f"Camera:\n{camera}, 9:16 vertical, sharp focus on subject, professional quality\n\n"
         f"Extra:\n{_EXTRA}"
     )

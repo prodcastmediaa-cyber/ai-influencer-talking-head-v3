@@ -201,7 +201,7 @@ Once training completes and the status shows **Ready**:
 
 ---
 
-### Step 10 — Configure Your Keys
+### Step 10 — Configure Your Keys and Hair Description
 
 Open `config.py` (created by setup.sh) in a text editor:
 
@@ -223,7 +223,48 @@ MIA_SOUL_ID = "paste-your-soul-id-here"   # the UUID from Step 9
 WAVESPEED_API_KEY = "paste-your-wavespeed-key-here"
 ```
 
-Save the file. **Never commit this file to GitHub** — it is already in `.gitignore`.
+#### Write Your Hair Description
+
+This is the one thing **you** must describe — everything else in the prompt (pose, lighting, environment, camera angle) is detected automatically from the video frame.
+
+Find this line in `config.py`:
+
+```python
+CHARACTER_HAIR_DESCRIPTION = "YOUR HAIR DESCRIPTION HERE"
+```
+
+Replace it with a detailed description of your character's hair. Be specific — the more detail you give, the more consistent the results will be across different videos.
+
+**What to include:**
+- Length (short, shoulder-length, long, waist-length)
+- Color (and undertones — e.g. "cool black" not just "black")
+- Texture (straight, wavy, curly, coily)
+- Finish (silky, matte, natural, glossy)
+- Any signature details (highlights, layers, natural part, etc.)
+
+**Examples:**
+
+```python
+# Straight black hair
+CHARACTER_HAIR_DESCRIPTION = (
+    "long natural jet-black hair with soft cool undertones, rich deep black tone, "
+    "subtle espresso sheen under light, smooth realistic texture, healthy silky finish"
+)
+
+# Curly auburn hair
+CHARACTER_HAIR_DESCRIPTION = (
+    "shoulder-length curly auburn hair, warm copper highlights, defined ringlets, "
+    "natural volume, soft frizz-free texture, rich chestnut undertone"
+)
+
+# Blonde wavy hair
+CHARACTER_HAIR_DESCRIPTION = (
+    "long beachy blonde hair with warm honey highlights, soft natural waves, "
+    "sun-kissed dimension, effortless texture, lightweight and voluminous"
+)
+```
+
+Save the file. **Never commit `config.py` to GitHub** — it is already in `.gitignore`.
 
 ---
 
