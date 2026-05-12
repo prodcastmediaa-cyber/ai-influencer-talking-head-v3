@@ -223,46 +223,30 @@ MIA_SOUL_ID = "paste-your-soul-id-here"   # the UUID from Step 9
 WAVESPEED_API_KEY = "paste-your-wavespeed-key-here"
 ```
 
-#### Write Your Hair Description
+#### Pick Your Hair Colour
 
-This is the one thing **you** must describe — everything else in the prompt (pose, lighting, environment, camera angle) is detected automatically from the video frame.
+This is the one setting **you** choose — everything else in the image prompt (pose, lighting, environment, camera angle) is detected automatically from the video frame.
 
 Find this line in `config.py`:
 
 ```python
-CHARACTER_HAIR_DESCRIPTION = "YOUR HAIR DESCRIPTION HERE"
+CHARACTER_HAIR = "jet_black"
 ```
 
-Replace it with a detailed description of your character's hair. Be specific — the more detail you give, the more consistent the results will be across different videos.
+Pick the option that best matches your character's hair:
 
-**What to include:**
-- Length (short, shoulder-length, long, waist-length)
-- Color (and undertones — e.g. "cool black" not just "black")
-- Texture (straight, wavy, curly, coily)
-- Finish (silky, matte, natural, glossy)
-- Any signature details (highlights, layers, natural part, etc.)
+| Key | Colour |
+|-----|--------|
+| `"jet_black"` | Jet black, cool undertones, silky finish |
+| `"dark_espresso"` | Dark brown/black mix, warm chestnut, sun-kissed ends |
+| `"red_head"` | Copper red, ginger undertones, warm golden highlights |
 
-**Examples:**
-
+Example — if your character has dark brown hair:
 ```python
-# Straight black hair
-CHARACTER_HAIR_DESCRIPTION = (
-    "long natural jet-black hair with soft cool undertones, rich deep black tone, "
-    "subtle espresso sheen under light, smooth realistic texture, healthy silky finish"
-)
-
-# Curly auburn hair
-CHARACTER_HAIR_DESCRIPTION = (
-    "shoulder-length curly auburn hair, warm copper highlights, defined ringlets, "
-    "natural volume, soft frizz-free texture, rich chestnut undertone"
-)
-
-# Blonde wavy hair
-CHARACTER_HAIR_DESCRIPTION = (
-    "long beachy blonde hair with warm honey highlights, soft natural waves, "
-    "sun-kissed dimension, effortless texture, lightweight and voluminous"
-)
+CHARACTER_HAIR = "dark_espresso"
 ```
+
+The full detailed hair prompt is built in automatically — you only need to pick the key.
 
 Save the file. **Never commit `config.py` to GitHub** — it is already in `.gitignore`.
 

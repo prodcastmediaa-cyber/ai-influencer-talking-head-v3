@@ -12,13 +12,33 @@ import cv2
 import numpy as np
 from config import (
     MIA_SOUL_ID,
-    CHARACTER_HAIR_DESCRIPTION,
+    CHARACTER_HAIR,
     EXTRACTED_FRAMES_DIR,
     OUTPUTS_DIR,
 )
 
 MODEL       = "text2image_soul_v2"
 NUM_OUTPUTS = 4
+
+HAIR_PRESETS = {
+    "jet_black": (
+        "long natural jet-black hair with soft cool undertones, rich deep black tone, "
+        "subtle espresso sheen under light, smooth realistic texture, soft dimensional shine, "
+        "healthy silky finish, natural dark brunette-black blend with effortless depth"
+    ),
+    "dark_espresso": (
+        "long dark espresso-brown hair with soft warm chestnut undertones, subtle caramel-brown "
+        "fade toward the ends, natural dimensional shine, realistic texture, soft brunette tone "
+        "with slightly sun-kissed warmth, effortless natural finish"
+    ),
+    "red_head": (
+        "long natural copper-red hair with rich ginger undertones, warm golden highlights, "
+        "soft dimensional shine, realistic texture, slightly sunlit auburn glow, "
+        "natural ginger red tone"
+    ),
+}
+
+_HAIR = HAIR_PRESETS.get(CHARACTER_HAIR, HAIR_PRESETS["jet_black"])
 
 _EXTRA = (
     "use reference soul character strictly, preserve exact face and identity, "
@@ -76,7 +96,7 @@ def analyze_frame(frame_path: str) -> str:
     prompt = (
         f"Pose:\n{pose}\n\n"
         f"Environment:\n{environment}, {lighting}, {tone}\n\n"
-        f"Clothing:\nstylish contemporary outfit suited to the scene, {CHARACTER_HAIR_DESCRIPTION}\n\n"
+        f"Clothing:\nstylish contemporary outfit suited to the scene, {_HAIR}\n\n"
         f"Camera:\n{camera}, 9:16 vertical, sharp focus on subject, professional quality\n\n"
         f"Extra:\n{_EXTRA}"
     )

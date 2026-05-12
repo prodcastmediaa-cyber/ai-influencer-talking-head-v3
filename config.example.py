@@ -27,19 +27,14 @@ OUTPUTS_DIR          = os.path.join(BASE_DIR, "outputs")
 # And log in:            higgsfield auth login
 HIGGSFIELD_API_KEY = "YOUR_HIGGSFIELD_API_KEY_HERE"
 
-# ─── Your AI Character — Hair Description ─────────────────────────────────────
-# Describe your character's hair in as much detail as possible.
-# This is injected into every generated image prompt under "Clothing".
-# Be specific: length, color, texture, shine, undertones, finish.
+# ─── Your AI Character — Hair ─────────────────────────────────────────────────
+# Pick the option that best matches your character's hair colour.
+# The full prompt is handled automatically — you just choose the key.
 #
-# Example (straight black hair):
-#   "long natural jet-black hair with soft cool undertones, rich deep black tone,
-#    subtle espresso sheen under light, smooth realistic texture, healthy silky finish"
-#
-# Example (curly auburn hair):
-#   "shoulder-length curly auburn hair, warm copper highlights, defined ringlets,
-#    natural volume, soft frizz-free texture, rich chestnut undertone"
-CHARACTER_HAIR_DESCRIPTION = "YOUR HAIR DESCRIPTION HERE"
+#   "jet_black"     — Jet black, cool undertones, silky finish
+#   "dark_espresso" — Dark brown/black mix, warm chestnut, sun-kissed ends
+#   "red_head"      — Copper red, ginger undertones, warm golden highlights
+CHARACTER_HAIR = "jet_black"
 
 # ─── Your AI Character — Soul ID ──────────────────────────────────────────────
 # This is the ID of the Soul Character you trained in Higgsfield.
