@@ -1,7 +1,6 @@
 """
-Generates 4 images using Higgsfield Nano Banana Pro.
-Image 1: Mia reference (character appearance)
-Image 2: Extracted scene frame (pose, outfit, background)
+v5 — Soul V2 + Mia soul_id + OpenCV frame analysis (no external APIs)
+soul_id locks identity to trained Mia character; OpenCV describes scene via prompt.
 """
 import subprocess
 import os
@@ -9,36 +8,98 @@ import json
 import glob
 import requests
 import concurrent.futures
+import cv2
+import numpy as np
 from config import (
-    MIA_REFERENCE_IMAGE,
+    MIA_SOUL_ID,
     EXTRACTED_FRAMES_DIR,
     OUTPUTS_DIR,
 )
 
-PROMPT = (
-    "The character from image 1 placed into the exact scene from image 2. "
-    "Use image 2 for all scene details: background, location, clothing, body pose, lighting, and composition. "
-    "Use image 1 only for the face and identity. "
-    "Photorealistic, sharp focus, high detail, 9:16 vertical."
-)
-
-MODEL       = "nano_banana_2"
-ASPECT      = "9:16"
-RESOLUTION  = "2k"
+MODEL       = "text2image_soul_v2"
 NUM_OUTPUTS = 4
 
+HAIR_DESCRIPTION = (
+    "long natural jet-black hair with soft cool undertones, rich deep black tone, "
+    "subtle espresso sheen under light, smooth realistic texture, soft dimensional shine, "
+    "healthy silky finish, natural dark brunette-black blend with effortless depth"
+)
 
-def run_generation(frame_path, output_dir, index):
+_EXTRA = (
+    "use reference soul character strictly, preserve exact face and identity, "
+    "natural skin texture, subtle eyeliner, light blush, soft nude lips, "
+    "realistic human details, no tattoos, avoid overly shiny skin"
+)
+
+
+def analyze_frame(frame_path: str) -> str:
+    img = cv2.imread(frame_path)
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    brightness = float(gray.mean())
+    if brightness > 170:
+        lighting = "bright natural daylight, high-key lighting, airy atmosphere"
+    elif brightness > 110:
+        lighting = "soft diffused daylight, balanced natural exposure"
+    elif brightness > 70:
+        lighting = "warm indoor lighting, golden hour feel, cozy ambiance"
+    else:
+        lighting = "moody low-key lighting, dramatic shadows, cinematic feel"
+
+    b_ch, g_ch, r_ch = cv2.split(img)
+    tone = "warm golden tones" if float(r_ch.mean()) > float(b_ch.mean()) else "cool blue-toned palette"
+
+    edges = cv2.Canny(gray, 100, 200)
+    complex_bg = float(edges.mean()) > 12
+    environment = (
+        "dynamic urban environment with architectural details in background"
+        if complex_bg else
+        "clean minimal background, uncluttered modern setting"
+    )
+
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
+    if len(faces) > 0:
+        fx, fy, fw, fh = faces[0]
+        face_y = (fy + fh / 2) / h
+    else:
+        face_y = 0.35
+
+    if face_y < 0.35:
+        pose = "close-up portrait, face and upper chest visible, slight angle to camera, natural expression"
+        camera = "tight portrait shot, eye-level, 85mm lens feel, shallow bokeh"
+    elif face_y < 0.55:
+        pose = "medium shot, upper body fully visible, relaxed confident posture, natural stance"
+        camera = "medium portrait, eye-level angle, 50mm lens feel, soft background blur"
+    else:
+        pose = "full body shot, confident standing pose, slight three-quarter angle, dynamic presence"
+        camera = "full body portrait, slight low angle, 35mm lens feel, cinematic framing"
+
+    prompt = (
+        f"Pose:\n{pose}\n\n"
+        f"Environment:\n{environment}, {lighting}, {tone}\n\n"
+        f"Clothing:\nstylish contemporary outfit suited to the scene, {HAIR_DESCRIPTION}\n\n"
+        f"Camera:\n{camera}, 9:16 vertical, sharp focus on subject, professional quality\n\n"
+        f"Extra:\n{_EXTRA}"
+    )
+    print(f"  [OpenCV] brightness={brightness:.0f}, complex_bg={complex_bg}, face_y={face_y:.2f}")
+    print(f"  [OpenCV] Prompt:\n{prompt}\n")
+    return prompt
+
+
+def run_generation(output_dir, index, prompt):
     print(f"  [Job {index+1}/{NUM_OUTPUTS}] Submitting...")
 
     result = subprocess.run(
         [
             "higgsfield", "generate", "create", MODEL,
-            "--image", MIA_REFERENCE_IMAGE,
-            "--image", frame_path,
-            "--prompt", PROMPT,
-            "--aspect_ratio", ASPECT,
-            "--resolution", RESOLUTION,
+            "--soul_id", MIA_SOUL_ID,
+            "--prompt", prompt,
+            "--aspect_ratio", "9:16",
+            "--quality", "2k",
             "--wait",
             "--json",
         ],
@@ -101,15 +162,18 @@ def generate_for_video(frame_path, on_progress=None):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"\nGenerating {NUM_OUTPUTS} outputs for: {video_name}")
-    print(f"  Character ref: {MIA_REFERENCE_IMAGE}")
-    print(f"  Scene frame:   {frame_path}")
+    print(f"\nAnalyzing frame (OpenCV): {video_name}")
+    prompt = analyze_frame(frame_path)
+
+    print(f"Generating {NUM_OUTPUTS} outputs for: {video_name}")
+    print(f"  Soul ID (Mia): {MIA_SOUL_ID}")
+    print(f"  Model:         {MODEL}")
     print(f"  Output dir:    {output_dir}")
 
     saved = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_OUTPUTS) as ex:
         futures = {
-            ex.submit(run_generation, frame_path, output_dir, i): i
+            ex.submit(run_generation, output_dir, i, prompt): i
             for i in range(NUM_OUTPUTS)
         }
         for future in concurrent.futures.as_completed(futures):
