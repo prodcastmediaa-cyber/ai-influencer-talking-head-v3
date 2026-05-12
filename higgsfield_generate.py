@@ -13,6 +13,7 @@ import numpy as np
 from config import (
     MIA_SOUL_ID,
     CHARACTER_HAIR,
+    SKIN_STYLE,
     EXTRACTED_FRAMES_DIR,
     OUTPUTS_DIR,
 )
@@ -40,10 +41,29 @@ HAIR_PRESETS = {
 
 _HAIR = HAIR_PRESETS.get(CHARACTER_HAIR, HAIR_PRESETS["jet_black"])
 
+SKIN_PRESETS = {
+    "soft": (
+        "smooth refined skin, soft-focus complexion, subtle skin detail, "
+        "gentle porcelain finish, even skin tone"
+    ),
+    "realistic": (
+        "natural skin pores visible, realistic skin micro-texture, subtle skin tone variations, "
+        "candid photography skin detail, human skin depth, no retouching, "
+        "natural uneven skin undertones"
+    ),
+    "imperfect": (
+        "authentic human skin, clearly visible pores, natural skin imperfections, "
+        "slight texture irregularities, raw unretouched skin detail, "
+        "documentary-style skin realism, lived-in natural complexion"
+    ),
+}
+
+_SKIN = SKIN_PRESETS.get(SKIN_STYLE, SKIN_PRESETS["realistic"])
+
 _EXTRA = (
     "use reference soul character strictly, preserve exact face and identity, "
-    "natural skin texture, subtle eyeliner, light blush, soft nude lips, "
-    "realistic human details, no tattoos, avoid overly shiny skin"
+    f"{_SKIN}, subtle eyeliner, light blush, soft nude lips, "
+    "realistic human details, no tattoos"
 )
 
 

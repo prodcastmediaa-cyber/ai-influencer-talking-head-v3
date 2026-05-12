@@ -36,6 +36,15 @@ HIGGSFIELD_API_KEY = "YOUR_HIGGSFIELD_API_KEY_HERE"
 #   "red_head"      — Copper red, ginger undertones, warm golden highlights
 CHARACTER_HAIR = "jet_black"
 
+# ─── Your AI Character — Skin Style ───────────────────────────────────────────
+# Controls how realistic vs polished the skin looks in generated images.
+# Mirrors Higgsfield's built-in Enhance filters, applied via prompt (no extra credits).
+#
+#   "soft"       — Smooth, polished, even-toned (most AI-looking)
+#   "realistic"  — Natural pores, skin texture, candid detail (recommended)
+#   "imperfect"  — Visible pores, raw unretouched skin, most human-looking
+SKIN_STYLE = "realistic"
+
 # ─── Your AI Character — Soul ID ──────────────────────────────────────────────
 # This is the ID of the Soul Character you trained in Higgsfield.
 # How to get it:

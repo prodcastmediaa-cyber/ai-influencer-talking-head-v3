@@ -248,6 +248,20 @@ CHARACTER_HAIR = "dark_espresso"
 
 The full detailed hair prompt is built in automatically — you only need to pick the key.
 
+#### Pick Your Skin Style
+
+This controls how polished vs human the skin looks. It replicates Higgsfield's website Enhance filters via prompt — no extra credits needed.
+
+```python
+SKIN_STYLE = "realistic"
+```
+
+| Key | Look |
+|-----|------|
+| `"soft"` | Smooth, even, polished — closest to default AI look |
+| `"realistic"` | Natural pores, skin texture, candid detail — **recommended** |
+| `"imperfect"` | Visible pores, raw unretouched skin — most human-looking |
+
 Save the file. **Never commit `config.py` to GitHub** — it is already in `.gitignore`.
 
 ---
