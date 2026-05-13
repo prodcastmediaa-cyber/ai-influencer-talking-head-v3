@@ -53,9 +53,9 @@ SKIN_PRESETS = {
         "gentle porcelain finish, even skin tone"
     ),
     "realistic": (
-        "natural skin pores visible, realistic skin micro-texture, subtle skin tone variations, "
+        "natural skin pores visible, realistic skin micro-texture, "
         "candid photography skin detail, human skin depth, no retouching, "
-        "natural uneven skin undertones"
+        "natural healthy skin glow"
     ),
     "imperfect": (
         "authentic human skin, clearly visible pores, natural skin imperfections, "
@@ -68,9 +68,12 @@ _HAIR = HAIR_PRESETS.get(CHARACTER_HAIR, HAIR_PRESETS["jet_black"])
 _SKIN = SKIN_PRESETS.get(SKIN_STYLE, SKIN_PRESETS["realistic"])
 
 _EXTRA = (
-    "use reference soul character strictly, preserve exact face, skin tone, facial proportions and identity, "
-    f"natural skin texture, {_SKIN}, soft glam makeup, subtle eyeliner, light blush, soft nude lips, "
-    "realistic human details, no tattoos, avoid plastic or overly shiny skin, natural asymmetry preserved"
+    "use soul character reference strictly — match exact face and facial identity, "
+    "fair light skin tone, warm peachy-beige complexion, do not darken or alter skin colour, "
+    f"natural skin texture, {_SKIN}, "
+    "soft glam makeup, subtle eyeliner, light blush, soft nude lips, "
+    "photorealistic, shot on camera, not CGI, not illustrated, not AI-generated looking, "
+    "realistic human proportions and natural asymmetry, no tattoos, avoid plastic or waxy skin"
 )
 
 SYSTEM_PROMPT = f"""You write image generation prompts for Higgsfield AI.
@@ -86,7 +89,7 @@ Clothing:
 [describe exactly what the person is wearing — every garment, color, style], {_HAIR}
 
 Camera:
-[shot type, angle, lens feel, depth of field], smartphone camera feel, slight telephoto look
+[shot type, angle, lens feel, depth of field], shot on iPhone, candid natural light, photorealistic, slight telephoto compression, soft background bokeh
 
 Extra:
 {_EXTRA}
