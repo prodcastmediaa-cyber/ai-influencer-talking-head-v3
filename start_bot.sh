@@ -1,35 +1,15 @@
 #!/bin/bash
-# Start/restart the AI Influencer bot.
-# Uses launchctl when a plist is registered (prevents dual-instance Conflict).
+# Start/restart the Mia AI Influencer bot.
 cd "$(dirname "$0")"
 
-SERVICE="com.aiinfluencer.watcher"
-PLIST="$HOME/Library/LaunchAgents/${SERVICE}.plist"
-
-if [ -f "$PLIST" ]; then
-    echo "Restarting via launchctl (clean single-instance restart)..."
-    # Unload completely — stops the process AND prevents launchd from restarting it
-    launchctl unload "$PLIST" 2>/dev/null || true
-    # Kill any stray watcher.py that escaped launchd's control
-    pkill -9 -f "python3.*watcher\.py" 2>/dev/null || true
-    rm -f .watcher.pid
-    # Wait for Telegram to release the old long-poll connection
-    echo "Waiting for Telegram to release old connection..."
-    sleep 5
-    # Load the service — launchd starts a single fresh instance
-    launchctl load "$PLIST"
-    echo "Bot started via launchctl."
-    exit 0
-fi
-
-# ── Fallback: no launchd service — start directly ────────────────────────────
-
+SCRIPT_DIR="$(pwd)"
 PID_FILE=".watcher.pid"
 
+# Kill any existing instance of THIS bot (by exact path, so Scar is untouched)
 if [ -f "$PID_FILE" ]; then
     OLD_PID=$(cat "$PID_FILE")
     if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "Stopping existing bot (PID $OLD_PID)..."
+        echo "Stopping existing Mia bot (PID $OLD_PID)..."
         kill "$OLD_PID"
         for i in $(seq 1 10); do
             kill -0 "$OLD_PID" 2>/dev/null || break
@@ -40,8 +20,12 @@ if [ -f "$PID_FILE" ]; then
     rm -f "$PID_FILE"
 fi
 
-pkill -9 -f "python3.*watcher\.py" 2>/dev/null || true
-sleep 4
+# Also catch any stray instance not tracked by the pid file
+pkill -f "$SCRIPT_DIR/watcher.py" 2>/dev/null || true
 
-nohup python3 watcher.py > /dev/null 2>&1 &
-echo "Bot started (PID $!)"
+echo "Waiting for Telegram to release old connection..."
+sleep 8
+
+nohup /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 "$SCRIPT_DIR/watcher.py" >> "$SCRIPT_DIR/watcher.log" 2>&1 &
+echo $! > "$PID_FILE"
+echo "Mia bot started (PID $(cat $PID_FILE))"

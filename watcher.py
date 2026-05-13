@@ -37,6 +37,7 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, filters,
 )
+from telegram.request import HTTPXRequest
 
 # Persistent bottom menu — always visible in the chat input area
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -1470,7 +1471,15 @@ async def main() -> None:
 
     _loop = asyncio.get_running_loop()
 
-    _app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    _request = HTTPXRequest(connection_pool_size=1, http_version="1.1")
+    _get_updates_request = HTTPXRequest(connection_pool_size=1, http_version="1.1")
+    _app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(_request)
+        .get_updates_request(_get_updates_request)
+        .build()
+    )
 
     # Commands
     _app.add_handler(CommandHandler("start",  _on_start))

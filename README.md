@@ -195,6 +195,16 @@ Then in Telegram:
 
 ---
 
+## Running 24/7 (VPS Deployment)
+
+By default the bot runs on your laptop — it stops when your computer sleeps or shuts down.
+
+To keep it running around the clock without your computer, deploy it to a cloud server. We use [Vultr](https://www.vultr.com/) — a $6/month server is enough.
+
+See the full guide: **[DEPLOY_VPS.md](DEPLOY_VPS.md)**
+
+---
+
 ## Notes
 
 - **Model files download automatically** on first run (`face_landmarker.task`, `hand_landmarker.task`, `EDSR_x2.pb`)

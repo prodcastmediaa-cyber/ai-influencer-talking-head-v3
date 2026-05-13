@@ -9,3 +9,5 @@ watchdog==4.0.1
 yt-dlp
 mediapipe
 opencv-python-headless
+anthropic>=0.40.0
+Pillow>=10.0.0

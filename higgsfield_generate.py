@@ -1,24 +1,32 @@
 """
-v5 — Soul V2 + Mia soul_id + OpenCV frame analysis (no external APIs)
-soul_id locks identity to trained Mia character; OpenCV describes scene via prompt.
+v7 — Soul V2 + Claude Vision (Scar architecture)
+System prompt bakes in the full template. Claude fills in scene. Response used directly.
 """
 import subprocess
 import os
 import json
 import glob
+import base64
+import io
+import logging
 import requests
 import concurrent.futures
-import cv2
-import numpy as np
+import anthropic
+from PIL import Image
 from config import (
     MIA_SOUL_ID,
     CHARACTER_HAIR,
     SKIN_STYLE,
+    CLAUDE_API_KEY,
     EXTRACTED_FRAMES_DIR,
     OUTPUTS_DIR,
 )
 
+log = logging.getLogger(__name__)
+
 MODEL       = "text2image_soul_v2"
+ASPECT      = "9:16"
+RESOLUTION  = "2k"
 NUM_OUTPUTS = 4
 
 HAIR_PRESETS = {
@@ -39,8 +47,6 @@ HAIR_PRESETS = {
     ),
 }
 
-_HAIR = HAIR_PRESETS.get(CHARACTER_HAIR, HAIR_PRESETS["jet_black"])
-
 SKIN_PRESETS = {
     "soft": (
         "smooth refined skin, soft-focus complexion, subtle skin detail, "
@@ -58,83 +64,96 @@ SKIN_PRESETS = {
     ),
 }
 
+_HAIR = HAIR_PRESETS.get(CHARACTER_HAIR, HAIR_PRESETS["jet_black"])
 _SKIN = SKIN_PRESETS.get(SKIN_STYLE, SKIN_PRESETS["realistic"])
 
 _EXTRA = (
-    "use reference soul character strictly, preserve exact face and identity, "
-    f"{_SKIN}, subtle eyeliner, light blush, soft nude lips, "
-    "realistic human details, no tattoos"
+    "use reference soul character strictly, preserve exact face, skin tone, facial proportions and identity, "
+    f"natural skin texture, {_SKIN}, soft glam makeup, subtle eyeliner, light blush, soft nude lips, "
+    "realistic human details, no tattoos, avoid plastic or overly shiny skin, natural asymmetry preserved"
 )
 
+SYSTEM_PROMPT = f"""You write image generation prompts for Higgsfield AI.
+Given a scene image, describe it using EXACTLY this structure — nothing else:
 
-def analyze_frame(frame_path: str) -> str:
-    img = cv2.imread(frame_path)
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+Pose:
+[person's exact body position, posture, expression and eye contact]
 
-    brightness = float(gray.mean())
-    if brightness > 170:
-        lighting = "bright natural daylight, high-key lighting, airy atmosphere"
-    elif brightness > 110:
-        lighting = "soft diffused daylight, balanced natural exposure"
-    elif brightness > 70:
-        lighting = "warm indoor lighting, golden hour feel, cozy ambiance"
-    else:
-        lighting = "moody low-key lighting, dramatic shadows, cinematic feel"
+Environment:
+[exact location, background details, lighting quality, time of day, color mood, atmosphere]
 
-    b_ch, g_ch, r_ch = cv2.split(img)
-    tone = "warm golden tones" if float(r_ch.mean()) > float(b_ch.mean()) else "cool blue-toned palette"
+Clothing:
+[describe exactly what the person is wearing — every garment, color, style], {_HAIR}
 
-    edges = cv2.Canny(gray, 100, 200)
-    complex_bg = float(edges.mean()) > 12
-    environment = (
-        "dynamic urban environment with architectural details in background"
-        if complex_bg else
-        "clean minimal background, uncluttered modern setting"
+Camera:
+[shot type, angle, lens feel, depth of field], smartphone camera feel, slight telephoto look
+
+Extra:
+{_EXTRA}
+
+Rules:
+- Be specific about every piece of clothing — exact colors, garment names, style
+- Never add extra sections or commentary
+- Always keep the Clothing line ending with the hair description exactly as given
+- Always keep the Extra section exactly as given"""
+
+
+def _compress_for_api(frame_path: str, max_bytes: int = 4 * 1024 * 1024) -> tuple:
+    img = Image.open(frame_path).convert("RGB")
+    for quality in (85, 70, 55, 40):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        data = buf.getvalue()
+        if len(data) <= max_bytes:
+            return data, "image/jpeg"
+    # Still too large — halve resolution and retry
+    w, h = img.size
+    img = img.resize((w // 2, h // 2), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=70)
+    return buf.getvalue(), "image/jpeg"
+
+
+def frame_to_prompt(frame_path: str) -> str:
+    img_bytes, media_type = _compress_for_api(frame_path)
+    img_b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
+    log.info(f"[claude] Sending frame ({len(img_bytes)//1024} KB) to Claude Vision")
+
+    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=600,
+        system=SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": img_b64},
+                },
+                {
+                    "type": "text",
+                    "text": "Write the Higgsfield prompt for this scene.",
+                },
+            ],
+        }],
     )
 
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
-    if len(faces) > 0:
-        fx, fy, fw, fh = faces[0]
-        face_y = (fy + fh / 2) / h
-    else:
-        face_y = 0.35
-
-    if face_y < 0.35:
-        pose = "close-up portrait, face and upper chest visible, slight angle to camera, natural expression"
-        camera = "tight portrait shot, eye-level, 85mm lens feel, shallow bokeh"
-    elif face_y < 0.55:
-        pose = "medium shot, upper body fully visible, relaxed confident posture, natural stance"
-        camera = "medium portrait, eye-level angle, 50mm lens feel, soft background blur"
-    else:
-        pose = "full body shot, confident standing pose, slight three-quarter angle, dynamic presence"
-        camera = "full body portrait, slight low angle, 35mm lens feel, cinematic framing"
-
-    prompt = (
-        f"Pose:\n{pose}\n\n"
-        f"Environment:\n{environment}, {lighting}, {tone}\n\n"
-        f"Clothing:\nstylish contemporary outfit suited to the scene, {_HAIR}\n\n"
-        f"Camera:\n{camera}, 9:16 vertical, sharp focus on subject, professional quality\n\n"
-        f"Extra:\n{_EXTRA}"
-    )
-    print(f"  [OpenCV] brightness={brightness:.0f}, complex_bg={complex_bg}, face_y={face_y:.2f}")
-    print(f"  [OpenCV] Prompt:\n{prompt}\n")
+    prompt = response.content[0].text.strip()
+    log.info(f"[claude] Prompt:\n{prompt}")
     return prompt
 
 
-def run_generation(output_dir, index, prompt):
-    print(f"  [Job {index+1}/{NUM_OUTPUTS}] Submitting...")
+def run_generation(prompt, output_dir, index):
+    log.info(f"[hf job {index+1}/{NUM_OUTPUTS}] Submitting")
 
     result = subprocess.run(
         [
             "higgsfield", "generate", "create", MODEL,
-            "--soul_id", MIA_SOUL_ID,
+            "--custom_reference_id", MIA_SOUL_ID,
             "--prompt", prompt,
-            "--aspect_ratio", "9:16",
-            "--quality", "2k",
+            "--aspect_ratio", ASPECT,
+            "--quality", RESOLUTION,
             "--wait",
             "--json",
         ],
@@ -145,11 +164,9 @@ def run_generation(output_dir, index, prompt):
 
     if result.returncode != 0:
         err = (result.stderr.strip() or result.stdout.strip())[:400]
-        print(f"  [Job {index+1}] CLI error (exit {result.returncode}): {err}")
+        log.error(f"[hf job {index+1}] CLI error (exit {result.returncode}): {err}")
         if "not authenticated" in err.lower() or "auth login" in err.lower():
-            raise RuntimeError(
-                f"Higgsfield CLI not authenticated — run: higgsfield auth login\n{err}"
-            )
+            raise RuntimeError(f"Higgsfield not authenticated — run: higgsfield auth login\n{err}")
         return None
 
     try:
@@ -163,26 +180,25 @@ def run_generation(output_dir, index, prompt):
             or data.get("url")
         )
         if not url:
-            print(f"  [Job {index+1}] No URL — status: {data.get('status', 'unknown')}")
+            log.error(f"[hf job {index+1}] No URL — status={data.get('status','unknown')}")
             return None
     except json.JSONDecodeError:
         for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("http"):
-                url = line
+            if line.strip().startswith("http"):
+                url = line.strip()
                 break
         else:
-            print(f"  [Job {index+1}] Could not parse output: {result.stdout[:300]}")
+            log.error(f"[hf job {index+1}] Could not parse output: {result.stdout[:300]}")
             return None
 
     out_path = os.path.join(output_dir, f"output_{index+1}.png")
-    print(f"  [Job {index+1}] Downloading → {os.path.basename(out_path)}")
+    log.info(f"[hf job {index+1}] Downloading → {os.path.basename(out_path)}")
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     with open(out_path, "wb") as f:
         f.write(r.content)
 
-    print(f"  [Job {index+1}] Saved: {out_path}")
+    log.info(f"[hf job {index+1}] Saved: {out_path}")
     return out_path
 
 
@@ -192,23 +208,20 @@ def generate_for_video(frame_path, on_progress=None):
 
     existing = glob.glob(os.path.join(output_dir, "output_*.png"))
     if existing:
-        print(f"\n[SKIP] {video_name}: {len(existing)} image(s) already generated.")
+        log.info(f"[SKIP] {video_name}: {len(existing)} image(s) already generated.")
         return sorted(existing)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"\nAnalyzing frame (OpenCV): {video_name}")
-    prompt = analyze_frame(frame_path)
+    log.info(f"[hf] Analyzing frame with Claude Vision: {video_name}")
+    prompt = frame_to_prompt(frame_path)
 
-    print(f"Generating {NUM_OUTPUTS} outputs for: {video_name}")
-    print(f"  Soul ID (Mia): {MIA_SOUL_ID}")
-    print(f"  Model:         {MODEL}")
-    print(f"  Output dir:    {output_dir}")
+    log.info(f"[hf] Submitting {NUM_OUTPUTS} jobs — soul={MIA_SOUL_ID} model={MODEL}")
 
     saved = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_OUTPUTS) as ex:
         futures = {
-            ex.submit(run_generation, output_dir, i, prompt): i
+            ex.submit(run_generation, prompt, output_dir, i): i
             for i in range(NUM_OUTPUTS)
         }
         for future in concurrent.futures.as_completed(futures):
@@ -221,9 +234,9 @@ def generate_for_video(frame_path, on_progress=None):
                 except Exception:
                     pass
 
-    print(f"\nDone: {len(saved)}/{NUM_OUTPUTS} images saved to {output_dir}")
+    log.info(f"[hf] Done: {len(saved)}/{NUM_OUTPUTS} saved to {output_dir}")
     if not saved:
-        raise RuntimeError(f"All {NUM_OUTPUTS} Higgsfield jobs failed — check terminal for the actual error")
+        raise RuntimeError("All 4 Higgsfield jobs failed — check terminal for the actual error")
     return sorted(saved)
 
 

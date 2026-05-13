@@ -21,6 +21,11 @@ CHARACTER_REF_DIR    = os.path.join(BASE_DIR, "character sheet")
 EXTRACTED_FRAMES_DIR = os.path.join(BASE_DIR, "extracted frames")
 OUTPUTS_DIR          = os.path.join(BASE_DIR, "outputs")
 
+# ─── Claude Vision (frame analysis) ──────────────────────────────────────────
+# Used to analyze extracted frames and write accurate scene prompts.
+# Get your key from: https://console.anthropic.com → API Keys
+CLAUDE_API_KEY = "YOUR_CLAUDE_API_KEY_HERE"
+
 # ─── Higgsfield ───────────────────────────────────────────────────────────────
 # Get your key from: https://higgsfield.ai → Settings → API
 # Also install the CLI:  pip install higgsfield
