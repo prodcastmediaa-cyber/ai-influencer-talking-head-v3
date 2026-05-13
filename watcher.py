@@ -416,7 +416,11 @@ async def _do_higgsfield(name: str) -> None:
 
     if not _has_higgsfield(name):
         # Surface the real error — auth failures were previously shown as "NSFW"
-        if "not authenticated" in hf_error.lower() or "auth login" in hf_error.lower():
+        if "OUT_OF_CREDITS:Higgsfield" in hf_error:
+            reason = "💳 Out of Higgsfield credits. Please top it up → higgsfield.ai/billing"
+        elif "OUT_OF_CREDITS:Claude" in hf_error:
+            reason = "💳 Out of Claude credits. Please top it up → console.anthropic.com/billing"
+        elif "not authenticated" in hf_error.lower() or "auth login" in hf_error.lower():
             reason = "Higgsfield CLI not authenticated. SSH into the VPS and run: `higgsfield auth login`"
         elif hf_error:
             reason = f"Higgsfield error: `{hf_error[:200]}`"
@@ -485,7 +489,11 @@ async def _do_wavespeed(name: str, loop: asyncio.AbstractEventLoop = None) -> No
             await _notify(f"⚠️ *{name}* — Wavespeed finished but no output found.")
     except Exception as e:
         log.exception(f"[{name}] Wavespeed error")
-        await _notify(f"❌ *{name}* — Wavespeed failed: `{e}`")
+        err_str = str(e)
+        if "OUT_OF_CREDITS:Wavespeed" in err_str:
+            await _notify(f"💳 *{name}* — Out of Wavespeed credits. Please top it up → wavespeed.ai/billing")
+        else:
+            await _notify(f"❌ *{name}* — Wavespeed failed: `{e}`")
     finally:
         with _lock:
             _processing.discard(name)

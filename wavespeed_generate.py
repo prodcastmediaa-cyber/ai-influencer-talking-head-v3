@@ -93,6 +93,14 @@ def submit_job(image_url, video_url):
     }
     r = requests.post(ENDPOINT, headers={**HEADERS, "Content-Type": "application/json"},
                       json=payload, timeout=30)
+    if not r.ok:
+        try:
+            msg = r.json().get("message") or r.text
+        except Exception:
+            msg = r.text
+        if "credit" in msg.lower() or "top up" in msg.lower() or "insufficient" in msg.lower() or "balance" in msg.lower():
+            raise RuntimeError("OUT_OF_CREDITS:Wavespeed")
+        raise RuntimeError(f"Wavespeed {r.status_code}: {msg}")
     r.raise_for_status()
     resp = r.json()
     data = resp.get("data", resp)

@@ -120,24 +120,30 @@ def frame_to_prompt(frame_path: str) -> str:
     log.info(f"[claude] Sending frame ({len(img_bytes)//1024} KB) to Claude Vision")
 
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=600,
-        system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": media_type, "data": img_b64},
-                },
-                {
-                    "type": "text",
-                    "text": "Write the Higgsfield prompt for this scene.",
-                },
-            ],
-        }],
-    )
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
+            system=SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": img_b64},
+                    },
+                    {
+                        "type": "text",
+                        "text": "Write the Higgsfield prompt for this scene.",
+                    },
+                ],
+            }],
+        )
+    except Exception as e:
+        err = str(e).lower()
+        if "credit" in err or "billing" in err or "quota" in err or "insufficient" in err or "overloaded" in err or "rate" in err:
+            raise RuntimeError("OUT_OF_CREDITS:Claude")
+        raise
 
     prompt = response.content[0].text.strip()
     log.info(f"[claude] Prompt:\n{prompt}")
@@ -167,6 +173,8 @@ def run_generation(prompt, output_dir, index):
         log.error(f"[hf job {index+1}] CLI error (exit {result.returncode}): {err}")
         if "not authenticated" in err.lower() or "auth login" in err.lower():
             raise RuntimeError(f"Higgsfield not authenticated — run: higgsfield auth login\n{err}")
+        if "credit" in err.lower() or "insufficient" in err.lower() or "balance" in err.lower() or "out of credit" in err.lower():
+            raise RuntimeError("OUT_OF_CREDITS:Higgsfield")
         return None
 
     try:
