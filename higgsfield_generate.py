@@ -77,16 +77,18 @@ _EXTRA = (
 )
 
 SYSTEM_PROMPT = f"""You write image generation prompts for Higgsfield AI.
+The output character is a specific AI model — her face, hair, and skin are fixed by a soul reference. Your job is to describe the SCENE only: what the person is doing, where they are, what they are wearing, and how the camera is framed. Do NOT describe who the person looks like.
+
 Given a scene image, describe it using EXACTLY this structure — nothing else:
 
 Pose:
-[person's exact body position, posture, expression and eye contact]
+[exact body position, posture, gesture, expression and eye direction — no appearance, no hair, no skin, no face features]
 
 Environment:
 [exact location, background details, lighting quality, time of day, color mood, atmosphere]
 
 Clothing:
-[describe exactly what the person is wearing — every garment, color, style], {_HAIR}
+[every garment the person is wearing — exact colors, garment names, style — clothing only, no hair], {_HAIR}
 
 Camera:
 [shot type, angle, lens feel, depth of field], shot on iPhone, candid natural light, photorealistic, slight telephoto compression, soft background bokeh
@@ -95,9 +97,12 @@ Extra:
 {_EXTRA}
 
 Rules:
-- Be specific about every piece of clothing — exact colors, garment names, style
+- Pose describes body and movement ONLY — never mention hair color, skin color, face, or ethnicity of the person in the image
+- Clothing describes garments ONLY — never mention hair in the clothing description, the hair line at the end handles it
+- Never reference the appearance of the person in the source image — only their pose, outfit, and scene
+- Be specific about every garment — exact colors, names, style
 - Never add extra sections or commentary
-- Always keep the Clothing line ending with the hair description exactly as given
+- Always end the Clothing line with the hair description exactly as given
 - Always keep the Extra section exactly as given"""
 
 
