@@ -9,11 +9,33 @@ A fully automated AI influencer content pipeline. Drop a link or video into Tele
 
 ---
 
-## What's New in V3 — Batch AI Generation
+## What's New in V3
 
-V3 adds a **"Let AI Create"** system that generates fully original photoshoots with no source video needed. You pick a style and a scene count — Claude invents unique scenes, Higgsfield renders them.
+### 1. NBP Mode — Nano Banana Pro Engine
 
-### The Flow
+V3 introduces a **second generation engine** alongside Soul Character 2.0: **Nano Banana Pro** (`nano_banana_2`).
+
+Where SC2.0 uses a trained Soul Character ID + a Claude-described prompt, NBP works differently — it takes **two reference images** and explicit instructions:
+
+- **Image 1** — your character's face photo (`character sheet mia/mia-face.png`) → locks identity, skin, hair
+- **Image 2** — the extracted frame from the source video → locks clothing, pose, scene, environment, lighting
+
+The prompt tells Higgsfield exactly which parts to take from each image:
+> *"Use reference image 1 for face structure, skin color, hair, and identity. Use reference image 2 for clothing, pose, scene composition, background, and lighting. Do not use face or identity from image 2."*
+
+**Why it exists:** SC2.0 excels at static portrait scenes. NBP handles **dancing and fast-movement content** better — when the source video has a lot of body motion, NBP's dual-reference approach preserves the energy and composition of the scene more naturally.
+
+In the Telegram bot, you choose your engine before pasting a link:
+- **🎯 SC2.0** — Soul Character 2.0, trained identity lock, best for lifestyle/portrait content
+- **🧠 NBP** — Nano Banana Pro, dual-image reference, best for dancing/moving scenes
+
+---
+
+### 2. Batch AI Generation — Let AI Create
+
+V3 also adds a **"Let AI Create"** system that generates fully original photoshoots with no source video needed. You pick a style and a scene count — Claude invents unique scenes, Higgsfield renders them.
+
+#### The Flow
 
 ```
 Tap "Let AI Create"
@@ -29,7 +51,7 @@ Tap "Let AI Create"
 
 **Fanvue Stuff** — intimate content. Indoor only (bedroom, bathroom, living room, dressing room). Lingerie, lace, satin. Natural window light.
 
-**Every scene is unique** — different outfit, different color, different pose, different location. Claude Haiku generates each scene individually with an explicit variety constraint, so you never get the same pink outfit twice.
+**Every scene is unique** — different outfit, different color, different pose, different location. Claude Haiku generates each scene individually with an explicit variety constraint, so you never get the same outfit twice.
 
 ---
 
@@ -37,7 +59,7 @@ Tap "Let AI Create"
 
 1. **Drop a link or video** — paste a TikTok / Instagram / YouTube URL in Telegram, or upload an .mp4 directly
 2. **Smart frame extraction** — MediaPipe scans every frame to find the best shot (eyes open, face unobstructed, sharpest detail), then upscales 2x with EDSR AI super-resolution
-3. **AI character generation** — Higgsfield Soul Character 2.0 generates 4 portrait images locked to your trained character's identity, placed in the same scene as the source
+3. **AI character generation** — choose your engine: **SC2.0** (Soul Character 2.0, trained identity lock) or **NBP** (Nano Banana Pro, dual-reference, better for dancing/moving scenes) — both generate 4 images in parallel
 4. **You pick one** — the bot sends all 4 to Telegram; you tap a button
 5. **Video generation** — Wavespeed Kling 2.6 Pro animates your chosen image using the original video as a motion reference
 6. **Delivery** — finished video sent to Telegram + uploaded to Google Drive
