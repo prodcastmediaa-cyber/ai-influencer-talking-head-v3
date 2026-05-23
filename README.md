@@ -1,6 +1,6 @@
 # AI Influencer Automation — V3
 
-> **This is Version 3.** Install after [V1](https://github.com/prodcastmediaa-cyber/ai-influencer-automation) and [V2](https://github.com/prodcastmediaa-cyber/ai-influencer-talking-head-v2).
+> **This is Version 3 — the latest and most complete version. Install this directly. You do not need V1 or V2.**
 
 A fully automated AI influencer content pipeline. Drop a link or video into Telegram — get a finished AI character video back. Or tap **Let AI Create** to generate entire photoshoots with zero source material.
 
@@ -68,17 +68,17 @@ Or skip all of that and just tap **Let AI Create** to generate a full photoshoot
 
 ---
 
-## Prerequisites — Install V1 and V2 First
+## Version History
 
-This repo is Version 3 of a multi-part series. You should have already set up:
+V3 is a complete standalone install — it includes everything from V1 and V2 plus the new features. You do not need to install earlier versions first.
 
-| Repo | What it adds |
-|------|-------------|
-| [V1 — ai-influencer-automation](https://github.com/prodcastmediaa-cyber/ai-influencer-automation) | Core clone pipeline: frame extraction, Higgsfield image gen, Wavespeed video gen, Telegram bot |
-| [V2 — ai-influencer-talking-head-v2](https://github.com/prodcastmediaa-cyber/ai-influencer-talking-head-v2) | Talking head + UGC video generation |
-| **V3 (this repo)** | Batch AI photoshoot generation — Daily Stuff & Fanvue Stuff |
+| Repo | What it contains |
+|------|----------------|
+| [V1 — ai-influencer-automation](https://github.com/prodcastmediaa-cyber/ai-influencer-automation) | Original clone pipeline (archived) |
+| [V2 — ai-influencer-talking-head-v2](https://github.com/prodcastmediaa-cyber/ai-influencer-talking-head-v2) | Talking head + UGC generation (archived) |
+| **V3 — this repo** | Everything from V1 + V2, plus NBP engine and batch AI photoshoot generation |
 
-If you haven't set up V1 yet, start there. V3 builds on the same config, Soul Character, and Telegram bot.
+**Start here. Clone V3 and follow the Quick Start below.**
 
 ---
 
@@ -90,7 +90,7 @@ cd ai-influencer-talking-head-v3
 bash setup.sh
 ```
 
-Then copy your `config.py` from your V1/V2 setup — all the same keys are used.
+Then open `config.py` and fill in your API keys (see [config.example.py](config.example.py) for the template).
 
 ```bash
 bash start_bot.sh
