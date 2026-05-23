@@ -9,7 +9,7 @@ PID_FILE=".watcher.pid"
 if [ -f "$PID_FILE" ]; then
     OLD_PID=$(cat "$PID_FILE")
     if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "Stopping existing Mia bot (PID $OLD_PID)..."
+        echo "Stopping existing bot (PID $OLD_PID)..."
         kill "$OLD_PID"
         for i in $(seq 1 10); do
             kill -0 "$OLD_PID" 2>/dev/null || break
@@ -26,6 +26,16 @@ pkill -f "$SCRIPT_DIR/watcher.py" 2>/dev/null || true
 echo "Waiting for Telegram to release old connection..."
 sleep 8
 
-nohup /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 "$SCRIPT_DIR/watcher.py" >> "$SCRIPT_DIR/watcher.log" 2>&1 &
+# Add venv binaries (including yt-dlp) to PATH so subprocess calls find them
+export PATH="$SCRIPT_DIR/venv/bin:$PATH"
+
+# Use venv Python if available, otherwise fall back to system python3
+if [ -f "$SCRIPT_DIR/venv/bin/python" ]; then
+    PYTHON="$SCRIPT_DIR/venv/bin/python"
+else
+    PYTHON="python3"
+fi
+
+nohup "$PYTHON" "$SCRIPT_DIR/watcher.py" >> "$SCRIPT_DIR/watcher.log" 2>&1 &
 echo $! > "$PID_FILE"
-echo "Mia bot started (PID $(cat $PID_FILE))"
+echo "Bot started (PID $(cat $PID_FILE))"

@@ -1,91 +1,82 @@
-# AI Influencer Video Generator
+# AI Influencer Automation — V3
 
-> A fully automated pipeline that takes any TikTok / Instagram / YouTube video, swaps the face with your custom AI character, and delivers a finished video to your Telegram — no manual work after initial setup.
+> **This is Version 3.** Install after [V1](https://github.com/prodcastmediaa-cyber/ai-influencer-automation) and [V2](https://github.com/prodcastmediaa-cyber/ai-influencer-talking-head-v2).
+
+A fully automated AI influencer content pipeline. Drop a link or video into Telegram — get a finished AI character video back. Or tap **Let AI Create** to generate entire photoshoots with zero source material.
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ---
 
-## What This Does
+## What's New in V3 — Batch AI Generation
 
-You create an AI character in Higgsfield, and this pipeline handles everything else:
+V3 adds a **"Let AI Create"** system that generates fully original photoshoots with no source video needed. You pick a style and a scene count — Claude invents unique scenes, Higgsfield renders them.
+
+### The Flow
+
+```
+Tap "Let AI Create"
+        ↓
+  🌸 Daily Stuff    🔥 Fanvue Stuff
+        ↓
+  2  4  6  8  (scenes)
+        ↓
+  2 images per scene = up to 16 total images
+```
+
+**Daily Stuff** — lifestyle & going-out content. City streets, rooftops, cafés, restaurants. Sexy mini dresses, club outfits, party dresses. Any environment.
+
+**Fanvue Stuff** — intimate content. Indoor only (bedroom, bathroom, living room, dressing room). Lingerie, lace, satin. Natural window light.
+
+**Every scene is unique** — different outfit, different color, different pose, different location. Claude Haiku generates each scene individually with an explicit variety constraint, so you never get the same pink outfit twice.
+
+---
+
+## How It Works (Full Pipeline)
 
 1. **Drop a link or video** — paste a TikTok / Instagram / YouTube URL in Telegram, or upload an .mp4 directly
-2. **Smart frame extraction** — MediaPipe scans every frame to find the single best shot (eyes open, face unobstructed, sharpest detail), then upscales it 2x with EDSR AI super-resolution
-3. **AI character generation** — Higgsfield Soul Character 2.0 generates 4 portrait images locked to your trained character's identity, placed in the same scene, pose, and lighting as the original
+2. **Smart frame extraction** — MediaPipe scans every frame to find the best shot (eyes open, face unobstructed, sharpest detail), then upscales 2x with EDSR AI super-resolution
+3. **AI character generation** — Higgsfield Soul Character 2.0 generates 4 portrait images locked to your trained character's identity, placed in the same scene as the source
 4. **You pick one** — the bot sends all 4 to Telegram; you tap a button
-5. **Video generation** — Wavespeed Kling 2.6 Pro Motion Control animates your chosen image using the original video as a motion reference
-6. **Delivery** — finished video is sent to Telegram + uploaded to Google Drive automatically
+5. **Video generation** — Wavespeed Kling 2.6 Pro animates your chosen image using the original video as a motion reference
+6. **Delivery** — finished video sent to Telegram + uploaded to Google Drive
 
-Everything runs 24/7 as a background process on your computer. You control it entirely from your phone.
-
----
-
-## How We Built This
-
-### The Problem
-
-Creating AI influencer content manually is brutally repetitive:
-- Download a source video
-- Scrub through to find a clean face frame
-- Upload to Higgsfield, wait 2–3 minutes, download 4 images
-- Manually pick the best one, upload to Wavespeed, wait again
-- Download the result, upload to Google Drive, update a tracking sheet
-
-For a single video this takes 15–20 minutes of active attention. At any real scale it's unsustainable.
-
-### The Solution
-
-We broke the problem into discrete, resumable steps with smart skip logic — if a step already ran, it won't run again. This means the whole pipeline is safe to run multiple times and can resume exactly where it stopped.
+Or skip all of that and just tap **Let AI Create** to generate a full photoshoot from scratch.
 
 ---
 
-### Step 1 — Smart Frame Extraction (`extract_frame.py`)
+## Prerequisites — Install V1 and V2 First
 
-The most underrated part of the pipeline. A bad input frame destroys the output even if everything downstream is perfect.
+This repo is Version 3 of a multi-part series. You should have already set up:
 
-We use **MediaPipe Face Landmarker** and **Hand Landmarker** together:
-- Sample 120 frames from the middle 90% of the video (skipping fade-in/fade-out)
-- Score each frame on 4 dimensions:
-  - **Eye blink score** (blendshapes: 0 = open, 1 = closed) — we want eyes open
-  - **Sharpness** (Laplacian variance on the face crop) — higher is better
-  - **Hand obstruction** (are any hand landmarks inside the face bounding box?)
-  - **Face visibility** (is a face even detected?)
-- Pick via tiered priority: clean face + eyes open + sharp → clean face + eyes open → clean face + sharpest → fallback
+| Repo | What it adds |
+|------|-------------|
+| [V1 — ai-influencer-automation](https://github.com/prodcastmediaa-cyber/ai-influencer-automation) | Core clone pipeline: frame extraction, Higgsfield image gen, Wavespeed video gen, Telegram bot |
+| [V2 — ai-influencer-talking-head-v2](https://github.com/prodcastmediaa-cyber/ai-influencer-talking-head-v2) | Talking head + UGC video generation |
+| **V3 (this repo)** | Batch AI photoshoot generation — Daily Stuff & Fanvue Stuff |
 
-Once the best frame is chosen, we apply **EDSR 2x AI super-resolution** (OpenCV DNN) to sharpen the face before sending to Higgsfield. Falls back to Lanczos upscaling if the model isn't available.
+If you haven't set up V1 yet, start there. V3 builds on the same config, Soul Character, and Telegram bot.
 
-### Step 2 — AI Character Generation (`higgsfield_generate.py`)
+---
 
-We use Higgsfield's **Soul Character 2.0** model (`text2image_soul_v2`) with a trained `soul_id` for strict identity locking:
-- **soul_id**: the UUID of your trained Soul Character (set once in `config.py`) — Higgsfield uses this to lock face, skin tone, hair, and overall identity
-- **Prompt**: generated by local OpenCV analysis of the extracted frame — describes lighting, background complexity, face position, and shot framing without needing any external API
+## Quick Start
 
-4 jobs run in parallel via `ThreadPoolExecutor` — 4x faster than sequential. Using a trained Soul Character produces far more consistent identity preservation than passing a reference image to a general-purpose model.
+```bash
+git clone https://github.com/prodcastmediaa-cyber/ai-influencer-talking-head-v3.git
+cd ai-influencer-talking-head-v3
+bash setup.sh
+```
 
-### Step 3 — Manual Selection (human in the loop)
+Then copy your `config.py` from your V1/V2 setup — all the same keys are used.
 
-You review the 4 generated images and pick the best one. In Telegram bot mode this is a single button tap. In CLI mode it's copying your chosen file to `selected.png`.
+```bash
+bash start_bot.sh
+```
 
-This is the one intentionally manual step — AI generation quality is still variable enough that a human eye is worth it before spending video generation credits.
+Open Telegram → tap **▶️ Start** → **🖼 Make Images** → **✨ Let AI Create**.
 
-### Step 4 — Video Generation (`wavespeed_generate.py`)
-
-We upload the selected image + original video to Wavespeed's API, submit a Kling 2.6 Pro Motion Control job, poll every 5 seconds, and download the result when done. Videos over 10 seconds are automatically trimmed before upload (Kling's hard limit).
-
-### Step 5 — The 24/7 Telegram Bot (`watcher.py`)
-
-A **Watchdog filesystem observer** watches `raw material/` for new .mp4 files — any new file automatically triggers the full pipeline. The Telegram bot layer adds:
-- **URL downloads** (TikTok, Instagram, YouTube via yt-dlp with automatic H.264 re-encoding)
-- **Direct file uploads** via Telegram (up to 20MB)
-- **Frame approval step** with retry option before spending Higgsfield credits
-- **Live progress bar** during image generation (updates as each of 4 jobs finishes)
-- **Image selection buttons** — tap 1, 2, 3, or 4
-- **Delivery** of finished video + Google Drive link
-- `/status`, `/cancel`, `/help` commands
-- **Single-instance enforcement** — safe to run `start_bot.sh` repeatedly
-- **Auto-resume on restart** — picks up mid-pipeline jobs where they left off
+> See [INSTALLATION.md](INSTALLATION.md) for the full step-by-step including Soul Character setup and VPS deployment.
 
 ---
 
@@ -93,15 +84,14 @@ A **Watchdog filesystem observer** watches `raw material/` for new .mp4 files �
 
 | Tool | Purpose |
 |------|---------|
-| [Higgsfield](https://higgsfield.ai) | AI character image generation (Soul Character 2.0, trained soul_id) |
+| [Higgsfield](https://higgsfield.ai) | AI character image generation (Soul Character 2.0) |
 | [Wavespeed Kling 2.6 Pro](https://wavespeed.ai) | Motion control video generation |
+| [Claude Haiku](https://anthropic.com) | Scene prompt generation for batch photoshoots |
 | [MediaPipe](https://mediapipe.dev) | Face landmark + blink detection, hand tracking |
 | [OpenCV + EDSR](https://github.com/Saafke/EDSR_Tensorflow) | Frame extraction + 2x AI super-resolution |
 | [python-telegram-bot](https://python-telegram-bot.org) | Async Telegram automation with inline buttons |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | TikTok / Instagram / YouTube download |
 | [Google Drive API](https://developers.google.com/drive) | Auto-upload finished videos |
-| [Google Sheets API](https://developers.google.com/sheets) | Pipeline tracking spreadsheet |
-| [Watchdog](https://github.com/gorakhargosh/watchdog) | Filesystem event watching for auto-trigger |
 | [ffmpeg](https://ffmpeg.org) | Video trimming, frame extraction, codec conversion |
 
 ---
@@ -109,26 +99,21 @@ A **Watchdog filesystem observer** watches `raw material/` for new .mp4 files �
 ## Folder Structure
 
 ```
-ai-influencer-automation/
-├── character sheet/           ← Your AI character reference images
-│   └── character-main.png    ← Primary reference (face identity)
+ai-influencer-v3/
 ├── raw material/              ← Drop .mp4 files here (or send via Telegram)
 ├── extracted frames/          ← Auto-generated best frames
 ├── outputs/
-│   ├── higgsfield/            ← 4 generated images per video
+│   ├── higgsfield/            ← Generated images (4 per clone, up to 16 per batch)
 │   └── wavespeed/             ← Final output videos
 │
 ├── config.example.py          ← Template — copy to config.py and fill in keys
 ├── config.py                  ← Your API keys (git-ignored, never committed)
-├── extract_frame.py           ← Step 1: Smart frame extraction + upscaling
-├── higgsfield_generate.py     ← Step 2: AI character image generation (4 parallel)
-├── wavespeed_generate.py      ← Step 4: Final video generation via Kling
-├── run_pipeline.py            ← One-command full pipeline runner
+├── higgsfield_generate.py     ← Image generation + batch prompt system
+├── wavespeed_generate.py      ← Video generation via Kling
+├── extract_frame.py           ← Smart frame extraction + upscaling
 ├── watcher.py                 ← 24/7 Telegram bot + filesystem daemon
-├── sheets.py                  ← Google Sheets read/write helper
-├── drive_upload.py            ← Google Drive upload helper
-├── setup_sheet.py             ← One-time: creates sheet column headers
-├── setup.sh                   ← First-time setup script (creates folders, installs deps)
+├── run_pipeline.py            ← One-command CLI pipeline runner
+├── setup.sh                   ← First-time setup (folders, deps, config template)
 ├── start_bot.sh               ← Start the 24/7 daemon in background
 ├── stop_bot.sh                ← Stop the daemon
 └── requirements.txt           ← Python dependencies
@@ -136,70 +121,24 @@ ai-influencer-automation/
 
 ---
 
-## Quick Start — with Claude Code + VS Code (Recommended)
-
-The easiest way to set everything up is to let Claude guide you:
-
-1. **Clone this repo**
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/ai-influencer-automation.git
-   cd ai-influencer-automation
-   ```
-2. **Open the folder in VS Code**
-3. **Open Claude Code** (the chat panel in the sidebar or bottom)
-4. **Type:** `set up this project for me`
-
-Claude will read the `CLAUDE.md` guide in this repo and walk you through every step interactively — creating folders, installing dependencies, filling in your API keys, and running a test.
-
-> See [INSTALLATION.md](INSTALLATION.md) for the full manual step-by-step (works without VS Code too).
-
----
-
-## Running the Pipeline
-
-### Option A — Simple CLI (no Telegram bot)
-
-```bash
-# Drop your .mp4 into raw material/, then:
-python3 run_pipeline.py
-
-# It will pause and ask you to pick the best Higgsfield image.
-# Open outputs/higgsfield/{video_name}/ → pick best → save as selected.png → run again:
-python3 run_pipeline.py
-```
-
-### Option B — 24/7 Telegram Bot
-
-```bash
-bash start_bot.sh    # start daemon in background
-bash stop_bot.sh     # stop it
-tail -f watcher.log  # view live logs
-```
-
-Then in Telegram:
-- Paste a TikTok / Instagram / YouTube link — it downloads automatically
-- Or send a video file (up to 20MB)
-- Follow the interactive buttons
-
----
-
-## API Keys You Need
+## API Keys
 
 | Service | Where to get it | Required? |
 |---------|----------------|-----------|
 | **Higgsfield API key** | [higgsfield.ai](https://higgsfield.ai) → Settings → API | Yes |
-| **Higgsfield CLI** | `pip install higgsfield && higgsfield auth login` | Yes |
+| **Higgsfield Soul Character ID** | higgsfield.ai → Soul Characters → your character → copy UUID | Yes |
+| **Claude API key** | [console.anthropic.com](https://console.anthropic.com) | Yes (for Let AI Create) |
 | **Wavespeed API key** | [wavespeed.ai](https://wavespeed.ai) → Dashboard → API Keys | Yes |
 | **Telegram Bot Token** | [@BotFather](https://t.me/BotFather) → /newbot | For bot mode |
-| **Google credentials.json** | Google Cloud Console → OAuth2 → Download | For Sheets + Drive |
+| **Google credentials.json** | Google Cloud Console → OAuth2 → Download | Optional (Drive upload) |
 
 ---
 
-## Running 24/7 (VPS Deployment)
+## Running 24/7 on a VPS
 
-By default the bot runs on your laptop — it stops when your computer sleeps or shuts down.
+The bot runs on your laptop by default — it stops when your computer sleeps.
 
-To keep it running around the clock without your computer, deploy it to a cloud server. We use [Vultr](https://www.vultr.com/) — a $6/month server is enough.
+To keep it running 24/7, deploy to a cloud VPS. We use [Vultr](https://www.vultr.com/) — a $6/month server handles everything since Higgsfield and Wavespeed do the heavy lifting on their own servers.
 
 See the full guide: **[DEPLOY_VPS.md](DEPLOY_VPS.md)**
 
@@ -207,11 +146,12 @@ See the full guide: **[DEPLOY_VPS.md](DEPLOY_VPS.md)**
 
 ## Notes
 
+- **Batch scenes run sequentially** — 2 Higgsfield jobs at a time, one scene at a time. This prevents Higgsfield from defaulting to catalog/grid layouts.
+- **No repeated outfits** — Claude generates each scene individually with an avoid list from previous scenes in the same run.
+- **No tattoos** — enforced at both the prompt and Extra level.
 - **Model files download automatically** on first run (`face_landmarker.task`, `hand_landmarker.task`, `EDSR_x2.pb`)
 - **Videos over 10 seconds** are auto-trimmed before Wavespeed upload
-- **Higgsfield generates 4 images in parallel** — 4x faster but uses 4 credits per video
-- **Instagram downloads** require cookies if the account is private — send `cookies.txt` to the bot
-- **The pipeline is fully resumable** — run `run_pipeline.py` as many times as you want; done steps are skipped
+- **Instagram downloads** require cookies if the account is private — send `cookies.txt` to the bot via Telegram
 
 ---
 

@@ -20,6 +20,7 @@ Commands:
 """
 import asyncio
 import atexit
+import functools
 import glob
 import logging
 import os
@@ -139,13 +140,23 @@ def _acquire_pid_lock() -> None:
 # ── Globals ───────────────────────────────────────────────────────────────────
 
 _executor = ThreadPoolExecutor(max_workers=2)
-_processing: set = set()   # names currently running through the pipeline
-_cancelled: set = set()    # names marked for cancellation
+_processing: set = set()      # names currently running through the pipeline
+_cancelled: set = set()       # names marked for cancellation
 _retry_counts: dict = {}
-_stage: dict = {}          # name → human-readable current stage string
+_stage: dict = {}             # name → human-readable current stage string
 _lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop = None
 _app: Application = None
+
+_pending_mode: set = set()    # names waiting for Clone / Talking Head selection
+_awaiting_script: dict = {}   # chat_id → name  (waiting for script text from user)
+_selected_mode: str = None    # "clone" or "ugc" — pre-selected before video arrives
+_awaiting_ref_image: dict = {}    # chat_id → name  (waiting for reference image upload)
+_make_images_names: set = set()   # names from Make Images flow — skip Wavespeed on pick
+_ai_prompt_names: set = set()     # names using AI Prompting mode (no frame file)
+_ai_create_style_pending: dict = {}   # chat_id → name (waiting for Daily/Fanvue choice)
+_ai_create_count_pending: dict = {}   # chat_id → (name, style) (waiting for 2/4/6/8 choice)
+_batch_config: dict = {}              # name → {"style": str, "num_sets": int}
 
 
 # ── State helpers ─────────────────────────────────────────────────────────────
@@ -165,8 +176,283 @@ def _has_higgsfield(name: str) -> bool:
 def _has_frame(name: str) -> bool:
     return os.path.exists(os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png"))
 
+def _has_ugc_output(name: str) -> bool:
+    return os.path.exists(os.path.join(OUTPUTS_DIR, "ugc", name, "output.mp4"))
+
 def _higgsfield_images(name: str) -> list:
     return sorted(glob.glob(os.path.join(OUTPUTS_DIR, "higgsfield", name, "output_*.png")))
+
+
+# ── Mode selection ────────────────────────────────────────────────────────────
+
+def _next_ugc_name() -> str:
+    existing = glob.glob(os.path.join(OUTPUTS_DIR, "ugc", "ugc*"))
+    nums = []
+    for d in existing:
+        stem = os.path.basename(d)
+        if stem.startswith("ugc") and stem[3:].isdigit():
+            nums.append(int(stem[3:]))
+    return f"ugc{max(nums) + 1}" if nums else "ugc1"
+
+
+def _next_make_images_name() -> str:
+    existing = glob.glob(os.path.join(OUTPUTS_DIR, "higgsfield", "img*"))
+    nums = []
+    for d in existing:
+        stem = os.path.basename(d)
+        if stem.startswith("img") and stem[3:].isdigit():
+            nums.append(int(stem[3:]))
+    return f"img{max(nums) + 1}" if nums else "img1"
+
+
+async def _send_mode_selection(reply_fn) -> None:
+    """Show Clone / Talking Head / Make Images choice."""
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎭 Clone Video",  callback_data="preselect_clone"),
+            InlineKeyboardButton("🎤 Talking Head", callback_data="preselect_ugc"),
+        ],
+        [
+            InlineKeyboardButton("🖼 Make Images",  callback_data="preselect_make_images"),
+        ],
+    ])
+    await reply_fn(
+        "What do you want to make?\n\n"
+        "🎭 *Clone Video* — Send a dance/reel link → swap identity with Mia\n"
+        "🎤 *Talking Head* — Type a script → Mia delivers it direct to camera\n"
+        "🖼 *Make Images* — Upload a reference image → generate 4 images with Mia",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def _on_preselect_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🧠 NBP",   callback_data="preselect_engine_nbp"),
+        InlineKeyboardButton("🎭 SC2.0", callback_data="preselect_engine_sc2"),
+    ]])
+    await _safe_edit(
+        query,
+        "🎭 *Clone Video* — Choose generation engine:\n\n"
+        "🧠 *NBP* — Nano Banana Pro (great for dancing / moving scenes)\n"
+        "🎭 *SC2.0* — Soul Character 2.0 (bypasses NSFW, consistent identity)",
+        keyboard=keyboard,
+    )
+
+
+async def _on_preselect_engine_sc2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _selected_mode
+    query = update.callback_query
+    await query.answer()
+    _selected_mode = "clone_sc2"
+    await _safe_edit(
+        query,
+        "🎭 *SC2.0 Clone* selected.\n\nNow paste a TikTok / Instagram / YouTube link, or send a video file.",
+        keyboard=None,
+    )
+
+
+async def _on_preselect_engine_nbp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _selected_mode
+    query = update.callback_query
+    await query.answer()
+    _selected_mode = "clone_nbp"
+    await _safe_edit(
+        query,
+        "🧠 *NBP Clone* selected.\n\nNow paste a TikTok / Instagram / YouTube link, or send a video file.",
+        keyboard=None,
+    )
+
+
+async def _on_preselect_ugc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    name = _next_ugc_name()
+    _awaiting_script[TELEGRAM_CHAT_ID] = name
+    await _safe_edit(
+        query,
+        "🎤 *Talking Head* — Send me the script and Mia will deliver it.\n\n"
+        "_Just type or paste it in the chat._",
+        keyboard=None,
+    )
+
+
+async def _on_preselect_make_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📸 Upload Image",  callback_data="make_img_upload"),
+        InlineKeyboardButton("✨ Let AI Create", callback_data="make_img_ai_prompt"),
+    ]])
+    await _safe_edit(
+        query,
+        "🖼 *Make Images* — How do you want to create?\n\n"
+        "📸 *Upload Image* — Send a reference photo → Mia replicates the scene\n"
+        "✨ *Let AI Create* — AI invents a random scene for Mia",
+        keyboard=keyboard,
+    )
+
+
+async def _on_make_img_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    name = _next_make_images_name()
+    _awaiting_ref_image[TELEGRAM_CHAT_ID] = name
+    _make_images_names.add(name)
+    await _safe_edit(
+        query,
+        f"📸 *Upload Image* — *{name}* ready!\n\n"
+        "Send a reference image (JPG, PNG, screenshot from Instagram/Pinterest) and Mia will be placed in the same scene.\n\n"
+        "_Just send the photo here — no links needed._",
+        keyboard=None,
+    )
+
+
+async def _on_make_img_ai_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    name = _next_make_images_name()
+    _ai_create_style_pending[TELEGRAM_CHAT_ID] = name
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🌸 Daily Stuff",  callback_data="ai_create_style:daily"),
+        InlineKeyboardButton("🔥 Fanvue Stuff", callback_data="ai_create_style:fanvue"),
+    ]])
+    await _safe_edit(
+        query,
+        "✨ *Let AI Create* — Pick a style:\n\n"
+        "🌸 *Daily Stuff* — lifestyle scenes, cute/casual/party outfits, any environment\n"
+        "🔥 *Fanvue Stuff* — teasing, intimate scenes, indoor only",
+        keyboard=keyboard,
+    )
+
+
+async def _on_ai_create_style(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, style = query.data.split(":", 1)
+    name = _ai_create_style_pending.pop(TELEGRAM_CHAT_ID, None)
+    if not name:
+        await _safe_edit(query, "⚠️ Session expired — tap *▶️ Start / Scan Queue* to begin again.", keyboard=None)
+        return
+    _ai_create_count_pending[TELEGRAM_CHAT_ID] = (name, style)
+    style_label = "🌸 Daily Stuff" if style == "daily" else "🔥 Fanvue Stuff"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("2 scenes · 4 imgs",  callback_data="ai_create_count:2"),
+            InlineKeyboardButton("4 scenes · 8 imgs",  callback_data="ai_create_count:4"),
+        ],
+        [
+            InlineKeyboardButton("6 scenes · 12 imgs", callback_data="ai_create_count:6"),
+            InlineKeyboardButton("8 scenes · 16 imgs", callback_data="ai_create_count:8"),
+        ],
+    ])
+    await _safe_edit(
+        query,
+        f"✨ *{style_label}* — How many unique scenes?\n\nEach scene = 2 images with the same outfit. Every scene has a different look.",
+        keyboard=keyboard,
+    )
+
+
+async def _on_ai_create_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, count_str = query.data.split(":", 1)
+    count = int(count_str)
+    pending = _ai_create_count_pending.pop(TELEGRAM_CHAT_ID, None)
+    if not pending:
+        await _safe_edit(query, "⚠️ Session expired — tap *▶️ Start / Scan Queue* to begin again.", keyboard=None)
+        return
+    name, style = pending
+    num_sets = count
+    total_imgs = num_sets * 2
+    _make_images_names.add(name)
+    _batch_config[name] = {"style": style, "num_sets": num_sets}
+    style_label = "Daily Stuff" if style == "daily" else "Fanvue Stuff"
+    await _safe_edit(
+        query,
+        f"✨ *{name}* — {count} scenes · {total_imgs} images total, generating now...",
+        keyboard=None,
+    )
+    asyncio.create_task(_pipeline_make_images_ai_batch(name, style, num_sets))
+
+
+async def _show_mode_popup(name: str) -> None:
+    """After a video is received, ask: Clone Video or Talking Head?"""
+    _pending_mode.add(name)
+    _stage[name] = "⏸ Waiting for mode selection"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎭 Clone Video",   callback_data=f"mode_clone:{name}"),
+            InlineKeyboardButton("🎤 Talking Head",  callback_data=f"mode_ugc:{name}"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{name}")],
+    ])
+    await _app.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=(
+            f"📥 *{name}* — Video ready! What do you want to do?\n\n"
+            f"🎭 *Clone Video* — Swap identity with Mia (existing pipeline)\n"
+            f"🎤 *Talking Head* — Mia delivers a custom script in your words"
+        ),
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def _route_new_video(name: str) -> None:
+    """Route a newly received video based on pre-selected mode (or show popup as fallback)."""
+    global _selected_mode
+    mode = _selected_mode
+    _selected_mode = None
+
+    if mode in ("clone", "clone_sc2"):
+        await _notify(f"🎭 *{name}* — Starting SC2.0 clone pipeline...")
+        asyncio.create_task(_pipeline(name, stable=True))
+    elif mode == "clone_nbp":
+        await _notify(f"🧠 *{name}* — Starting NBP clone pipeline...")
+        asyncio.create_task(_pipeline_nbp(name, stable=True))
+    elif mode == "ugc":
+        _awaiting_script[TELEGRAM_CHAT_ID] = name
+        _stage[name] = "⏸ Waiting for script"
+        await _notify(
+            f"🎤 *{name}* — Video received!\n\nSend me the script and Mia will deliver it."
+        )
+    else:
+        await _show_mode_popup(name)
+
+
+async def _on_new_video(name: str) -> None:
+    """Watchdog handler: wait for file stability then route based on pre-selected mode."""
+    global _selected_mode
+    video_path = os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4")
+    if not await _wait_until_stable(video_path):
+        await _notify(f"❌ *{name}* — File not readable after waiting.")
+        return
+
+    # URL/upload handler already routed this video while we were waiting for stability
+    if name in _pending_mode or name in _processing:
+        return
+
+    mode = _selected_mode
+    _selected_mode = None  # consume it
+
+    if mode in ("clone", "clone_sc2"):
+        await _notify(f"🎭 *{name}* — Starting SC2.0 clone pipeline...")
+        asyncio.create_task(_pipeline(name, stable=True))
+    elif mode == "clone_nbp":
+        await _notify(f"🧠 *{name}* — Starting NBP clone pipeline...")
+        asyncio.create_task(_pipeline_nbp(name, stable=True))
+    elif mode == "ugc":
+        _awaiting_script[TELEGRAM_CHAT_ID] = name
+        _stage[name] = "⏸ Waiting for script"
+        await _notify(
+            f"🎤 *{name}* — Video received!\n\nSend me the script and Mia will deliver it."
+        )
+    else:
+        # No mode pre-selected — fall back to popup
+        await _show_mode_popup(name)
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
@@ -305,21 +591,61 @@ def _step2_higgsfield(name: str, on_progress=None) -> None:
     generate_for_video(frame, on_progress=on_progress)
 
 
+def _step2_higgsfield_ai(name: str, on_progress=None) -> None:
+    from higgsfield_generate import generate_ai_for_video
+    output_dir = os.path.join(OUTPUTS_DIR, "higgsfield", name)
+    generate_ai_for_video(name, output_dir, on_progress=on_progress)
+
+
+def _step2_nbp(name: str, on_progress=None) -> None:
+    from higgsfield_generate import generate_nbp_for_video
+    frame = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+    generate_nbp_for_video(frame, on_progress=on_progress)
+
+
 def _step4_wavespeed(name: str) -> str:
     from wavespeed_generate import process_video
     video_path = os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4")
-    return process_video(video_path)
+    out_path = process_video(video_path)
+    if out_path and os.path.exists(out_path):
+        _reencode_for_telegram(out_path)
+    return out_path
+
+
+def _reencode_for_telegram(path: str) -> None:
+    """Re-encode to CRF 23 so Telegram can stream it (Wavespeed outputs ~32 Mbps)."""
+    tmp = path + ".tmp.mp4"
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", path,
+         "-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
+         "-c:a", "aac", "-b:a", "128k",
+         "-movflags", "+faststart",
+         tmp],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        os.replace(tmp, path)
+    else:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        log.warning(f"Re-encode failed (sending original): {result.stderr.decode()[-200:]}")
 
 
 def _video_dimensions(path: str) -> tuple:
     import json
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "json", path],
+         "-show_entries", "stream=width,height,duration", "-of", "json", path],
         capture_output=True, text=True,
     )
     streams = json.loads(r.stdout).get("streams", [{}])
-    return streams[0].get("width", 1080), streams[0].get("height", 1920)
+    s = streams[0] if streams else {}
+    width    = s.get("width", 1080)
+    height   = s.get("height", 1920)
+    duration = max(1, int(float(s.get("duration", 1))))
+    return width, height, duration
 
 
 # ── File stability check ──────────────────────────────────────────────────────
@@ -406,7 +732,8 @@ async def _do_higgsfield(name: str) -> None:
 
     hf_error: str = ""
     try:
-        await loop.run_in_executor(_executor, _step2_higgsfield, name, _on_progress)
+        step_fn = _step2_higgsfield_ai if name in _ai_prompt_names else _step2_higgsfield
+        await loop.run_in_executor(_executor, step_fn, name, _on_progress)
     except Exception as e:
         hf_error = str(e)
         log.exception(f"[{name}] Higgsfield error")
@@ -420,6 +747,8 @@ async def _do_higgsfield(name: str) -> None:
             reason = "💳 Out of Higgsfield credits. Please top it up → higgsfield.ai/billing"
         elif "OUT_OF_CREDITS:Claude" in hf_error:
             reason = "💳 Out of Claude credits. Please top it up → console.anthropic.com/billing"
+        elif "CLAUDE_REFUSED" in hf_error:
+            reason = "⚠️ Claude Vision refused this frame (content policy). Try a different video or skip to a cleaner scene."
         elif "not authenticated" in hf_error.lower() or "auth login" in hf_error.lower():
             reason = "Higgsfield CLI not authenticated. SSH into the VPS and run: `higgsfield auth login`"
         elif hf_error:
@@ -441,7 +770,101 @@ async def _do_higgsfield(name: str) -> None:
 
     try:
         await progress_msg.edit_text(
-            f"✅ *{name}* — 4 images ready! Choose the best one below.",
+            f"✅ *{name}* — 4 images ready!",
+            parse_mode="Markdown",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    try:
+        if name in _make_images_names:
+            await _send_make_images_result(name)
+        else:
+            await _send_selection_prompt(name)
+    except Exception as e:
+        log.exception(f"[{name}] Failed to send results to Telegram")
+        await _notify(f"❌ *{name}* — Images ready but failed to send: `{str(e)[:200]}`")
+        with _lock:
+            _processing.discard(name)
+
+
+async def _do_nbp(name: str) -> None:
+    loop = asyncio.get_running_loop()
+
+    if name in _cancelled:
+        return
+
+    cancel_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{name}")
+    ]])
+
+    try:
+        progress_msg = await _app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=f"🧠 *{name}* — NBP generating images... [░░░░] 0/4",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb,
+        )
+    except Exception as e:
+        log.error(f"[{name}] Could not send NBP progress message: {e}")
+        with _lock:
+            _processing.discard(name)
+        return
+    _stage[name] = "🧠 NBP generating images (0/4)"
+
+    def _on_progress(count: int):
+        if name in _cancelled:
+            return
+        bar = "▓" * count + "░" * (4 - count)
+        _stage[name] = f"🧠 NBP generating images ({count}/4)"
+        try:
+            asyncio.run_coroutine_threadsafe(
+                progress_msg.edit_text(
+                    f"🧠 *{name}* — NBP generating images... [{bar}] {count}/4",
+                    parse_mode="Markdown",
+                    reply_markup=cancel_kb,
+                ),
+                _loop,
+            ).result(timeout=10)
+        except Exception:
+            pass
+
+    nbp_error: str = ""
+    try:
+        await loop.run_in_executor(_executor, _step2_nbp, name, _on_progress)
+    except Exception as e:
+        nbp_error = str(e)
+        log.exception(f"[{name}] NBP error")
+
+    if name in _cancelled:
+        return
+
+    if not _has_higgsfield(name):
+        if "OUT_OF_CREDITS:Higgsfield" in nbp_error:
+            reason = "💳 Out of Higgsfield credits. Please top it up → higgsfield.ai/billing"
+        elif "not authenticated" in nbp_error.lower() or "auth login" in nbp_error.lower():
+            reason = "Higgsfield CLI not authenticated. SSH into the VPS and run: `higgsfield auth login`"
+        elif nbp_error:
+            reason = f"NBP error: `{nbp_error[:200]}`"
+        else:
+            reason = "All 4 NBP jobs failed — check VPS logs."
+        try:
+            await progress_msg.edit_text(
+                f"❌ *{name}* — NBP image generation failed.",
+                parse_mode="Markdown",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+        await _send_failure_actions(name, reason)
+        with _lock:
+            _processing.discard(name)
+        return
+
+    try:
+        await progress_msg.edit_text(
+            f"✅ *{name}* — 4 NBP images ready! Choose the best one below.",
             parse_mode="Markdown",
             reply_markup=None,
         )
@@ -464,17 +887,22 @@ async def _do_wavespeed(name: str, loop: asyncio.AbstractEventLoop = None) -> No
         if out_path and os.path.exists(out_path):
             _retry_counts.pop(name, None)
             size_mb = os.path.getsize(out_path) / 1_000_000
-            width, height = _video_dimensions(out_path)
+            width, height, duration = _video_dimensions(out_path)
             await _notify(f"✅ *{name}* — Done! Uploading video ({size_mb:.1f} MB)...")
+            voice_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🎙 Replace with Mia's Voice", callback_data=f"voice_replace:{name}")
+            ]])
             with open(out_path, "rb") as f:
                 await _app.bot.send_video(
                     chat_id=TELEGRAM_CHAT_ID,
                     video=f,
-                    caption=f"🎬 *{name}*",
+                    caption=f"🎬 *{name}*\n\nTap below to replace the audio with Mia's cloned voice.",
                     parse_mode="Markdown",
                     supports_streaming=True,
                     width=width,
                     height=height,
+                    duration=duration,
+                    reply_markup=voice_kb,
                 )
             if _DRIVE_ENABLED:
                 try:
@@ -567,6 +995,379 @@ async def _pipeline(name: str, stable: bool = False) -> None:
             _processing.discard(name)
 
 
+async def _pipeline_nbp(name: str, stable: bool = False) -> None:
+    with _lock:
+        if name in _processing:
+            log.info(f"[{name}] Already in progress — skipping duplicate.")
+            return
+        _processing.add(name)
+
+    loop = asyncio.get_running_loop()
+    try:
+        video_path = os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4")
+
+        if not stable and not await _wait_until_stable(video_path):
+            await _notify(f"❌ *{name}* — File not readable after waiting.")
+            with _lock:
+                _processing.discard(name)
+            return
+
+        if name in _cancelled:
+            with _lock:
+                _processing.discard(name)
+            return
+
+        # Step 1 — extract best frame
+        if not _has_frame(name):
+            _stage[name] = "📥 Extracting frame"
+            await _notify(f"📥 *{name}* — Extracting best frame...")
+            await loop.run_in_executor(_executor, _step1_extract, name)
+
+            if name in _cancelled:
+                with _lock:
+                    _processing.discard(name)
+                return
+            if not _has_frame(name):
+                await _notify(f"❌ *{name}* — Frame extraction failed. Check logs.")
+                with _lock:
+                    _processing.discard(name)
+                return
+
+        # Step 2 — NBP image generation
+        if not _has_higgsfield(name):
+            if name in _cancelled:
+                with _lock:
+                    _processing.discard(name)
+                return
+            asyncio.create_task(_do_nbp(name))
+            return
+
+        # Step 3 — images exist, show selection (startup resume)
+        if not _has_selected(name):
+            if name in _cancelled:
+                with _lock:
+                    _processing.discard(name)
+                return
+            await _send_selection_prompt(name)
+            return
+
+        # Step 4 — selected.png exists, run Wavespeed
+        await _do_wavespeed(name, loop)
+
+    except Exception as e:
+        log.exception(f"[{name}] Unexpected NBP pipeline error")
+        await _send_failure_actions(name, f"NBP pipeline error: `{e}`")
+        with _lock:
+            _processing.discard(name)
+
+
+async def _pipeline_make_images(name: str) -> None:
+    """Make Images flow: reference frame already saved, skip extraction, go straight to SC2.0."""
+    with _lock:
+        if name in _processing:
+            log.info(f"[{name}] Already in progress — skipping duplicate.")
+            return
+        _processing.add(name)
+
+    try:
+        if not _has_frame(name):
+            await _notify(f"❌ *{name}* — Reference frame not found. Please try again.")
+            with _lock:
+                _processing.discard(name)
+            return
+        asyncio.create_task(_do_higgsfield(name))
+        # _processing stays active until user picks (released in _on_pick for make_images)
+    except Exception as e:
+        log.exception(f"[{name}] Make Images pipeline error")
+        await _notify(f"❌ *{name}* — Make Images failed: `{e}`")
+        with _lock:
+            _processing.discard(name)
+
+
+async def _pipeline_make_images_ai(name: str) -> None:
+    """AI Prompting flow: no frame needed — Claude invents the scene."""
+    with _lock:
+        if name in _processing:
+            log.info(f"[{name}] Already in progress — skipping duplicate.")
+            return
+        _processing.add(name)
+
+    try:
+        asyncio.create_task(_do_higgsfield(name))
+    except Exception as e:
+        log.exception(f"[{name}] AI prompt pipeline error")
+        await _notify(f"❌ *{name}* — AI Prompting failed: `{e}`")
+        with _lock:
+            _processing.discard(name)
+
+
+def _step2_higgsfield_batch(name: str, style: str, num_sets: int, on_progress=None) -> None:
+    from higgsfield_generate import generate_ai_batch
+    output_dir = os.path.join(OUTPUTS_DIR, "higgsfield", name)
+    generate_ai_batch(name, output_dir, style, num_sets, on_progress=on_progress)
+
+
+async def _pipeline_make_images_ai_batch(name: str, style: str, num_sets: int) -> None:
+    """Batch AI flow: generates num_sets*2 images across num_sets unique scenes."""
+    with _lock:
+        if name in _processing:
+            log.info(f"[{name}] Already in progress — skipping duplicate.")
+            return
+        _processing.add(name)
+
+    try:
+        asyncio.create_task(_do_higgsfield_batch(name, style, num_sets))
+    except Exception as e:
+        log.exception(f"[{name}] Batch pipeline error")
+        await _notify(f"❌ *{name}* — Batch generation failed: `{e}`")
+        with _lock:
+            _processing.discard(name)
+
+
+async def _do_higgsfield_batch(name: str, style: str, num_sets: int) -> None:
+    import functools
+    loop = asyncio.get_running_loop()
+    total = num_sets * 2
+
+    if name in _cancelled:
+        return
+
+    cancel_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{name}")
+    ]])
+
+    bar_empty = "░" * total
+    try:
+        progress_msg = await _app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=f"🎨 *{name}* — Generating {total} images... [{bar_empty}] 0/{total}",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb,
+        )
+    except Exception as e:
+        log.error(f"[{name}] Could not send batch progress message: {e}")
+        with _lock:
+            _processing.discard(name)
+        return
+    _stage[name] = f"🎨 Generating images (0/{total})"
+
+    def _on_progress(count: int):
+        if name in _cancelled:
+            return
+        bar = "▓" * count + "░" * (total - count)
+        _stage[name] = f"🎨 Generating images ({count}/{total})"
+        try:
+            asyncio.run_coroutine_threadsafe(
+                progress_msg.edit_text(
+                    f"🎨 *{name}* — Generating {total} images... [{bar}] {count}/{total}",
+                    parse_mode="Markdown",
+                    reply_markup=cancel_kb,
+                ),
+                _loop,
+            ).result(timeout=10)
+        except Exception:
+            pass
+
+    hf_error: str = ""
+    try:
+        step_fn = functools.partial(_step2_higgsfield_batch, name, style, num_sets)
+        await loop.run_in_executor(_executor, step_fn, _on_progress)
+    except Exception as e:
+        hf_error = str(e)
+        log.exception(f"[{name}] Higgsfield batch error")
+
+    if name in _cancelled:
+        return
+
+    if not _has_higgsfield(name):
+        if "OUT_OF_CREDITS:Higgsfield" in hf_error:
+            reason = "💳 Out of Higgsfield credits. Please top it up → higgsfield.ai/billing"
+        elif "OUT_OF_CREDITS:Claude" in hf_error:
+            reason = "💳 Out of Claude credits. Please top it up → console.anthropic.com/billing"
+        elif "CLAUDE_REFUSED" in hf_error:
+            reason = "⚠️ Claude refused the batch prompt request. Try again."
+        elif "not authenticated" in hf_error.lower() or "auth login" in hf_error.lower():
+            reason = "Higgsfield CLI not authenticated. Run: `higgsfield auth login`"
+        elif hf_error:
+            reason = f"Higgsfield batch error: `{hf_error[:200]}`"
+        else:
+            reason = f"All {total} Higgsfield batch jobs failed — check logs."
+        try:
+            await progress_msg.edit_text(
+                f"❌ *{name}* — Batch generation failed.",
+                parse_mode="Markdown",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+        await _send_failure_actions(name, reason)
+        with _lock:
+            _processing.discard(name)
+        return
+
+    try:
+        await progress_msg.edit_text(
+            f"✅ *{name}* — {total} images ready!",
+            parse_mode="Markdown",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    try:
+        await _send_make_images_result(name)
+    except Exception as e:
+        log.exception(f"[{name}] Failed to send batch results to Telegram")
+        await _notify(f"❌ *{name}* — Images ready but failed to send: `{str(e)[:200]}`")
+        with _lock:
+            _processing.discard(name)
+
+
+# ── Reference image upload handler ────────────────────────────────────────────
+
+async def _on_ref_image_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle photo / image document uploads for the Make Images flow."""
+    msg = update.message
+    chat_id = str(update.effective_chat.id)
+
+    waiting_key = chat_id if chat_id in _awaiting_ref_image else (
+        TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID in _awaiting_ref_image else None
+    )
+    if not waiting_key:
+        return
+
+    name = _awaiting_ref_image.pop(waiting_key)
+
+    if msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/"):
+        tg_file = await msg.document.get_file()
+    elif msg.photo:
+        tg_file = await msg.photo[-1].get_file()
+    else:
+        _awaiting_ref_image[waiting_key] = name
+        return
+
+    reply = await msg.reply_text(f"📥 *{name}* — Saving reference image...", parse_mode="Markdown")
+
+    try:
+        import tempfile
+        os.makedirs(EXTRACTED_FRAMES_DIR, exist_ok=True)
+        frame_path = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        tmp.close()
+        await tg_file.download_to_drive(tmp.name)
+
+        from PIL import Image as _PILImage
+        img = _PILImage.open(tmp.name).convert("RGB")
+        img.save(frame_path, format="PNG")
+        os.unlink(tmp.name)
+
+        await reply.delete()
+        log.info(f"[make_images] {name}: reference image saved → {frame_path}")
+
+        confirm_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, generate!", callback_data=f"make_img_yes:{name}"),
+            InlineKeyboardButton("❌ No",             callback_data=f"make_img_no:{name}"),
+        ]])
+        with open(frame_path, "rb") as img_f:
+            await _app.bot.send_photo(
+                chat_id=TELEGRAM_CHAT_ID,
+                photo=img_f,
+                caption="Do you want to replicate this image with Mia?",
+                reply_markup=confirm_kb,
+            )
+
+    except Exception as e:
+        log.error(f"[make_images] Failed to save reference image: {e}")
+        _make_images_names.discard(name)
+        await reply.edit_text(f"❌ Failed to save image: `{e}`", parse_mode="Markdown")
+
+
+# ── Make Images result / confirm handlers ────────────────────────────────────
+
+async def _send_make_images_result(name: str) -> None:
+    """Send all 4 generated images + Restart Gen / Cancel buttons. No picking needed."""
+    images = _higgsfield_images(name)
+    if not images:
+        return
+
+    for i, path in enumerate(images, 1):
+        with open(path, "rb") as f:
+            await _app.bot.send_photo(
+                chat_id=TELEGRAM_CHAT_ID,
+                photo=f,
+                caption=f"`{name}` — Image {i}",
+                parse_mode="Markdown",
+            )
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Restart Gen", callback_data=f"make_img_restart:{name}"),
+        InlineKeyboardButton("❌ Cancel",       callback_data=f"cancel:{name}"),
+    ]])
+    await _app.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=f"🖼 *{name}* — Here are your {len(images)} images! Save whichever you like.",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    _stage[name] = "✅ Done"
+    with _lock:
+        _processing.discard(name)
+
+
+async def _on_make_img_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+    await _safe_edit(query, f"✅ *{name}* — Generating with Mia...", keyboard=None)
+    asyncio.create_task(_pipeline_make_images(name))
+
+
+async def _on_make_img_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+    _make_images_names.discard(name)
+    frame_path = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
+    if os.path.exists(frame_path):
+        os.remove(frame_path)
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
+    await _safe_edit(
+        query,
+        "👍 No problem! Tap *▶️ Start / Scan Queue* for more options.",
+        keyboard=None,
+    )
+
+
+async def _on_make_img_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    is_ai = name in _ai_prompt_names
+    is_batch = name in _batch_config
+    shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
+    _cancelled.discard(name)
+    with _lock:
+        _processing.discard(name)
+    _make_images_names.add(name)
+
+    await query.edit_message_text(
+        f"🔄 *{name}* — Deleted old images. Regenerating...", parse_mode="Markdown"
+    )
+
+    if is_batch:
+        cfg = _batch_config[name]
+        with _lock:
+            _processing.add(name)
+        asyncio.create_task(_do_higgsfield_batch(name, cfg["style"], cfg["num_sets"]))
+    elif is_ai:
+        _ai_prompt_names.add(name)
+        asyncio.create_task(_do_higgsfield(name))
+    else:
+        asyncio.create_task(_do_higgsfield(name))
+
+
 # ── Telegram handlers ─────────────────────────────────────────────────────────
 
 async def _on_frame_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -610,6 +1411,8 @@ async def _on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     with _lock:
         _processing.discard(name)
     _stage.pop(name, None)
+    _make_images_names.discard(name)
+    _ai_prompt_names.discard(name)
 
     shutil.rmtree(os.path.join(OUTPUTS_DIR, "higgsfield", name), ignore_errors=True)
     frame_path = os.path.join(EXTRACTED_FRAMES_DIR, f"{name}_frame.png")
@@ -640,6 +1443,24 @@ async def _on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     shutil.copy2(src, dst)
     log.info(f"[{name}] User picked output_{num}.png → selected.png")
+
+    if name in _make_images_names:
+        await query.edit_message_text(
+            f"✅ *{name}* — Picked option {num}! Sending your image...",
+            parse_mode="Markdown",
+        )
+        with open(src, "rb") as f:
+            await _app.bot.send_photo(
+                chat_id=TELEGRAM_CHAT_ID,
+                photo=f,
+                caption=f"🖼 *{name}* — Done!",
+                parse_mode="Markdown",
+            )
+        _make_images_names.discard(name)
+        _stage[name] = "✅ Done"
+        with _lock:
+            _processing.discard(name)
+        return
 
     await query.edit_message_text(
         f"✅ *{name}* — Picked option {num}! Starting Wavespeed...",
@@ -710,7 +1531,7 @@ def _download_url(url: str, name: str) -> str:
             h264_path = tmp_path.replace(".mp4", "_h264.mp4")
             enc = subprocess.run(
                 ["ffmpeg", "-y", "-i", tmp_path,
-                 "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                 "-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
                  "-c:a", "aac", "-movflags", "+faststart", h264_path],
                 capture_output=True,
             )
@@ -727,6 +1548,21 @@ def _download_url(url: str, name: str) -> str:
 
 async def _on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
+
+    # Check if we're waiting for a script from the user
+    chat_id = str(update.effective_chat.id)
+    waiting_key = chat_id if chat_id in _awaiting_script else (
+        TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID in _awaiting_script else None
+    )
+    if waiting_key and not re.match(r"https?://", text):
+        name = _awaiting_script.pop(waiting_key)
+        await update.message.reply_text(
+            f"🎤 *{name}* — Got it! Generating with Mia's voice...",
+            parse_mode="Markdown",
+        )
+        asyncio.create_task(_do_ugc_pipeline(name, text))
+        return
+
     if not re.match(r"https?://", text):
         return
 
@@ -737,12 +1573,9 @@ async def _on_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     loop = asyncio.get_running_loop()
     try:
         final = await loop.run_in_executor(_executor, _download_url, text, name)
-        queue_depth = len(_processing)
-        queue_note = f"\n⏳ {queue_depth} other video(s) processing — yours is queued." if queue_depth else ""
-        await msg.edit_text(
-            f"✅ *{name}* — Downloaded! Pipeline starting...{queue_note}", parse_mode="Markdown"
-        )
+        await msg.edit_text(f"✅ *{name}* — Downloaded!", parse_mode="Markdown")
         log.info(f"[download] {text} → {final}")
+        await _route_new_video(name)
     except Exception as e:
         err = str(e)
         log.error(f"[download] Failed: {err}")
@@ -881,7 +1714,7 @@ async def _on_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 _executor,
                 lambda: subprocess.run(
                     ["ffmpeg", "-y", "-i", tmp_path,
-                     "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                     "-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
                      "-c:a", "aac", "-movflags", "+faststart", final_tmp],
                     capture_output=True,
                 ),
@@ -893,16 +1726,161 @@ async def _on_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         dest = os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4")
         shutil.move(final_tmp, dest)
-        await reply.edit_text(
-            f"✅ *{name}* — Saved! Pipeline starting...", parse_mode="Markdown"
-        )
+        await reply.edit_text(f"✅ *{name}* — Saved!", parse_mode="Markdown")
         log.info(f"[upload] Telegram video ({ext}, {codec}) → {dest}")
+        await _route_new_video(name)
 
     except Exception as e:
         log.error(f"[upload] Failed: {e}")
         await reply.edit_text(f"❌ Upload failed: `{e}`", parse_mode="Markdown")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ── Mode selection callbacks ──────────────────────────────────────────────────
+
+async def _on_mode_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User chose Clone Video — show engine sub-menu (NBP or SC2.0)."""
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+    _pending_mode.discard(name)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🧠 NBP",   callback_data=f"engine_nbp:{name}"),
+        InlineKeyboardButton("🎭 SC2.0", callback_data=f"engine_sc2:{name}"),
+    ]])
+    await _safe_edit(
+        query,
+        f"🎭 *{name}* — Choose generation engine:\n\n"
+        "🧠 *NBP* — Nano Banana Pro (great for dancing / moving scenes)\n"
+        "🎭 *SC2.0* — Soul Character 2.0 (bypasses NSFW, consistent identity)",
+        keyboard=keyboard,
+    )
+
+
+async def _on_engine_sc2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+    await _safe_edit(query, f"🎭 *{name}* — Starting SC2.0 clone pipeline...")
+    asyncio.create_task(_pipeline(name, stable=True))
+
+
+async def _on_engine_nbp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+    await _safe_edit(query, f"🧠 *{name}* — Starting NBP clone pipeline...")
+    asyncio.create_task(_pipeline_nbp(name, stable=True))
+
+
+async def _on_mode_ugc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User chose Talking Head — ask for the script."""
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+    _pending_mode.discard(name)
+    _awaiting_script[TELEGRAM_CHAT_ID] = name
+    _stage[name] = "⏸ Waiting for script"
+    await _safe_edit(
+        query,
+        f"🎤 *{name}* — Send me the script and Mia will deliver it.\n\n"
+        f"_Just type or paste it in the chat._",
+        keyboard=None,
+    )
+
+
+# ── Talking Head pipeline ─────────────────────────────────────────────────────
+
+def _step_ugc(name: str, script: str) -> str:
+    from ugc_generate import generate_and_swap
+    out_dir = os.path.join(OUTPUTS_DIR, "ugc", name)
+    os.makedirs(out_dir, exist_ok=True)
+    return generate_and_swap(script, out_dir)
+
+
+async def _do_ugc_pipeline(name: str, script: str) -> None:
+    loop = asyncio.get_running_loop()
+    with _lock:
+        _processing.add(name)
+    _stage[name] = "🎤 Generating talking head"
+
+    try:
+        await _notify(f"🎤 *{name}* — Generating talking head (Higgsfield + Mia's voice)...")
+        out_path = await loop.run_in_executor(_executor, _step_ugc, name, script)
+
+        if out_path and os.path.exists(out_path):
+            size_mb = os.path.getsize(out_path) / 1_000_000
+            width, height, duration = _video_dimensions(out_path)
+            with open(out_path, "rb") as f:
+                await _app.bot.send_video(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    video=f,
+                    caption=f"🎤 *{name}* — Talking head done! ({size_mb:.1f} MB)",
+                    parse_mode="Markdown",
+                    supports_streaming=True,
+                    width=width,
+                    height=height,
+                    duration=duration,
+                )
+            _stage[name] = "✅ Done"
+        else:
+            await _notify(f"❌ *{name}* — Talking head generation failed. Check VPS logs.")
+    except Exception as e:
+        log.exception(f"[{name}] UGC pipeline error")
+        err = str(e)
+        if "OUT_OF_CREDITS:Higgsfield" in err:
+            await _notify(f"💳 *{name}* — Out of Higgsfield credits → higgsfield.ai/billing")
+        elif "OUT_OF_CREDITS:ElevenLabs" in err:
+            await _notify(f"💳 *{name}* — Out of ElevenLabs credits → elevenlabs.io/billing")
+        else:
+            await _notify(f"❌ *{name}* — Talking head failed: `{err[:200]}`")
+    finally:
+        with _lock:
+            _processing.discard(name)
+
+
+# ── Voice replace callback (Clone Video flow) ─────────────────────────────────
+
+def _step_voice_replace(name: str) -> str:
+    from voice_swap import process as voice_process
+    video_path = os.path.join(OUTPUTS_DIR, "wavespeed", name, "output.mp4")
+    out_path   = os.path.join(OUTPUTS_DIR, "wavespeed", name, "output_mia_voice.mp4")
+    return voice_process(video_path, output_path=out_path)
+
+
+async def _on_voice_replace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+
+    await _safe_edit(query, f"🎙 *{name}* — Replacing audio with Mia's voice...", keyboard=None)
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(_executor, _step_voice_replace, name)
+        if result and os.path.exists(result):
+            size_mb = os.path.getsize(result) / 1_000_000
+            width, height, duration = _video_dimensions(result)
+            with open(result, "rb") as f:
+                await _app.bot.send_video(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    video=f,
+                    caption=f"🎙 *{name}* — Mia's voice applied! ({size_mb:.1f} MB)",
+                    parse_mode="Markdown",
+                    supports_streaming=True,
+                    width=width,
+                    height=height,
+                    duration=duration,
+                )
+        else:
+            await _notify(f"❌ *{name}* — Voice replace failed — output not found.")
+    except Exception as e:
+        log.exception(f"[{name}] Voice replace error")
+        err = str(e)
+        if "OUT_OF_CREDITS:ElevenLabs" in err:
+            await _notify(f"💳 *{name}* — Out of ElevenLabs credits → elevenlabs.io/billing")
+        else:
+            await _notify(f"❌ *{name}* — Voice replace failed: `{err[:200]}`")
 
 
 async def _on_hf_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1074,6 +2052,8 @@ async def _on_cancel_do(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     _cancelled.add(name)
     with _lock:
         _processing.discard(name)
+    _make_images_names.discard(name)
+    _ai_prompt_names.discard(name)
 
     for p in [
         os.path.join(RAW_MATERIAL_DIR, f"{name}.mp4"),
@@ -1120,7 +2100,10 @@ async def _on_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _processing.discard(name)
 
     await query.edit_message_text(f"🔄 *{name}* — Retrying...", parse_mode="Markdown")
-    asyncio.create_task(_pipeline(name))
+    if name in _make_images_names:
+        asyncio.create_task(_pipeline_make_images(name))
+    else:
+        asyncio.create_task(_pipeline(name))
 
 
 async def _on_delete_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1251,8 +2234,7 @@ async def _on_keyboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _on_status(update, context)
 
     elif text == "▶️ Start / Scan Queue":
-        await update.message.reply_text("🔍 Scanning queue...", parse_mode="Markdown")
-        await _startup_scan()
+        await _send_mode_selection(update.message.reply_text)
 
     elif text == "🔄 Hard Restart":
         await update.message.reply_text(
@@ -1401,8 +2383,10 @@ class _VideoWatcher(FileSystemEventHandler):
         if not path.lower().endswith(".mp4"):
             return
         name = _vname(path)
+        if name in _pending_mode or name in _processing:
+            return  # already handled by URL/upload handler
         log.info(f"[watchdog] Detected: {os.path.basename(path)}")
-        asyncio.run_coroutine_threadsafe(_pipeline(name), _loop)
+        asyncio.run_coroutine_threadsafe(_on_new_video(name), _loop)
 
     def on_created(self, event):
         if not event.is_directory:
@@ -1433,6 +2417,8 @@ async def _startup_scan() -> None:
         name = _vname(v)
         if _has_output(name):
             lines.append(f"• `{name}` — ✅ Already done")
+        elif _has_ugc_output(name):
+            lines.append(f"• `{name}` — ✅ Talking head done")
         elif _has_selected(name):
             lines.append(f"• `{name}` — ⚡ Resuming Wavespeed")
             pending.append(("wavespeed", name))
@@ -1497,7 +2483,24 @@ async def main() -> None:
     _app.add_handler(CommandHandler("clean",  _on_clean_cmd))
 
     # Callback buttons — order matters: more specific patterns first
-    _app.add_handler(CallbackQueryHandler(_on_frame_approve,      pattern=r"^frame_approve:"))
+    _app.add_handler(CallbackQueryHandler(_on_preselect_clone,         pattern=r"^preselect_clone$"))
+    _app.add_handler(CallbackQueryHandler(_on_preselect_engine_sc2,   pattern=r"^preselect_engine_sc2$"))
+    _app.add_handler(CallbackQueryHandler(_on_preselect_engine_nbp,   pattern=r"^preselect_engine_nbp$"))
+    _app.add_handler(CallbackQueryHandler(_on_preselect_ugc,          pattern=r"^preselect_ugc$"))
+    _app.add_handler(CallbackQueryHandler(_on_preselect_make_images,  pattern=r"^preselect_make_images$"))
+    _app.add_handler(CallbackQueryHandler(_on_make_img_upload,        pattern=r"^make_img_upload$"))
+    _app.add_handler(CallbackQueryHandler(_on_make_img_ai_prompt,     pattern=r"^make_img_ai_prompt$"))
+    _app.add_handler(CallbackQueryHandler(_on_ai_create_style,        pattern=r"^ai_create_style:"))
+    _app.add_handler(CallbackQueryHandler(_on_ai_create_count,        pattern=r"^ai_create_count:"))
+    _app.add_handler(CallbackQueryHandler(_on_make_img_yes,           pattern=r"^make_img_yes:"))
+    _app.add_handler(CallbackQueryHandler(_on_make_img_no,            pattern=r"^make_img_no:"))
+    _app.add_handler(CallbackQueryHandler(_on_make_img_restart,       pattern=r"^make_img_restart:"))
+    _app.add_handler(CallbackQueryHandler(_on_mode_clone,            pattern=r"^mode_clone:"))
+    _app.add_handler(CallbackQueryHandler(_on_engine_sc2,            pattern=r"^engine_sc2:"))
+    _app.add_handler(CallbackQueryHandler(_on_engine_nbp,            pattern=r"^engine_nbp:"))
+    _app.add_handler(CallbackQueryHandler(_on_mode_ugc,              pattern=r"^mode_ugc:"))
+    _app.add_handler(CallbackQueryHandler(_on_voice_replace,       pattern=r"^voice_replace:"))
+    _app.add_handler(CallbackQueryHandler(_on_frame_approve,       pattern=r"^frame_approve:"))
     _app.add_handler(CallbackQueryHandler(_on_frame_retry_new,    pattern=r"^frame_retry:"))
     _app.add_handler(CallbackQueryHandler(_on_cancel,             pattern=r"^cancel:"))
     _app.add_handler(CallbackQueryHandler(_on_cancel_list,        pattern=r"^cancel_list$"))
@@ -1528,7 +2531,8 @@ async def main() -> None:
     ])
     _app.add_handler(MessageHandler(_kb_filter, _on_keyboard_button))
 
-    # Messages
+    # Messages — image handler first so PHOTO / Document.IMAGE goes to Make Images flow
+    _app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, _on_ref_image_upload))
     _app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, _on_video_upload))
     _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_url))
 
