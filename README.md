@@ -17,7 +17,7 @@ V3 introduces a **second generation engine** alongside Soul Character 2.0: **Nan
 
 Where SC2.0 uses a trained Soul Character ID + a Claude-described prompt, NBP works differently — it takes **two reference images** and explicit instructions:
 
-- **Image 1** — your character's face photo (`character sheet mia/mia-face.png`) → locks identity, skin, hair
+- **Image 1** — your character's face photo (`character sheet/character-main.png`) → locks identity, skin, hair
 - **Image 2** — the extracted frame from the source video → locks clothing, pose, scene, environment, lighting
 
 The prompt tells Higgsfield exactly which parts to take from each image:
